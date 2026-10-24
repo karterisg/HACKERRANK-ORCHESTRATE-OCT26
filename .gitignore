@@ -1,0 +1,34 @@
+# Secrets
+.env
+*.env
+*.key
+*.pem
+
+# Dataset (large files, personal data from challenge)
+dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Output (generated — commit only when final)
+output.csv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
