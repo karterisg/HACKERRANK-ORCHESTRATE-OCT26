@@ -550,6 +550,102 @@ def parse_structured_events_log(fid, cat, path, idx, hash_to_emails):
     except Exception as e: log.warning("struct events log %s: %s",path.name,e)
 
 
+RID_SYS_MAP = {
+    "support_":        "support_platform",
+    "audit_record_":   "security_service",
+    "account_":        "account_service",
+    "analytics_":      "analytics_platform",
+    "search_":         "search_service",
+    "export_":         "export_service",
+    "data_flow_":      "integration_service",
+    "backup_":         "backup_service",
+    "tombstone_":      "account_service",
+}
+
+def _rid_to_sys(rid: str) -> str:
+    for prefix, sys_id in RID_SYS_MAP.items():
+        if rid.startswith(prefix):
+            return sys_id
+    return "unknown"
+
+
+def _pdf_extract_text(path) -> str:
+    """Extract text from PDF using pdfplumber (handles CMap-encoded fonts).
+    Falls back to raw byte scan for ASCII-visible text."""
+    try:
+        import pdfplumber as _plumber
+        parts = []
+        with _plumber.open(str(path)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t: parts.append(t)
+        return "\n".join(parts)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    # Fallback: try to install pdfplumber silently, then retry
+    try:
+        import subprocess, sys
+        subprocess.run([sys.executable, "-m", "pip", "install", "pdfplumber", "-q"],
+                       capture_output=True, timeout=30)
+        import importlib
+        import pdfplumber as _plumber  # noqa
+        importlib.invalidate_caches()
+        parts = []
+        with _plumber.open(str(path)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t: parts.append(t)
+        return "\n".join(parts)
+    except Exception:
+        pass
+    # Last resort: scan raw bytes for ASCII readable strings ≥6 chars
+    raw = path.read_bytes()
+    strings = re.findall(rb'[ -~]{6,}', raw)
+    return " ".join(s.decode('ascii', 'ignore') for s in strings)
+
+
+def parse_pdf(fid, cat, path, idx):
+    """Extract records from PDF documents using stdlib zlib decompression."""
+    try:
+        text = _pdf_extract_text(path)
+    except Exception as e:
+        log.warning("pdf parse %s: %s", path.name, e)
+        return
+
+    rid_pattern = re.compile(
+        r'\b(support|audit_record|account|analytics|search|export|data_flow|backup|tombstone)_\d+\b'
+    )
+    email_pattern = re.compile(r'\b[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}\b')
+    uid_pattern = re.compile(r'\buser_\d+\b')
+
+    found_rids = list(dict.fromkeys(m.group() for m in rid_pattern.finditer(text)))
+    found_emails = list(dict.fromkeys(norm(e) for e in email_pattern.findall(text) if _is_email(e)))
+    found_uids = list(dict.fromkeys(uid_pattern.findall(text)))
+
+    if not found_rids:
+        return
+
+    # Determine data_category override based on filename
+    fname_lower = path.name.lower()
+    extra_category = None
+    if "attachment" in fname_lower:
+        extra_category = "SUPPORT_ATTACHMENT"
+    elif "statement" in fname_lower or "report" in fname_lower:
+        extra_category = "LEGAL_HOLD_RECORD"
+    elif "retention" in fname_lower or "legal" in fname_lower or "register" in fname_lower:
+        extra_category = "LEGAL_HOLD_RECORD"
+    elif "compliance" in fname_lower or "security" in fname_lower:
+        extra_category = "SECURITY_AUDIT_LOG"
+
+    for rid in found_rids:
+        sys_id = _rid_to_sys(rid)
+        extra = {"data_category": extra_category} if extra_category else {}
+        idx.add(Record(fid, cat, sys_id, rid, "PRESENT",
+                       emails=found_emails, user_ids=found_uids, extra=extra))
+
+
 def parse_handover_txt(fid, cat, path, idx):
     STATUS_MAP = {"NOT_FOUND":"ABSENT","FOUND":"PRESENT","IDENTIFIABLE":"PRESENT",
                   "ANONYMIZED":"ANONYMIZED","ACTIVE":"ACTIVE","DISABLED":"DISABLED",
@@ -693,6 +789,8 @@ def build_index(evidence_csv, hash_to_emails: Dict[str,str]):
                     parse_structured_events_log(fid,cat,path,idx,hash_to_emails)
                 else:
                     parse_service_events_log(fid,cat,path,idx,hash_to_emails)
+            elif suf==".pdf":
+                parse_pdf(fid,cat,path,idx)
         except Exception as e: log.warning("index %s: %s",fid,e)
     log.info("Index: %d email keys, %d uid keys, %d hash keys",
              len(idx._email), len(idx._uid), len(idx._hash))
@@ -736,35 +834,118 @@ def build_identity(identities, audit_log):
     return e2u, u2e, h2e
 
 
-def build_activity_account_map(activity_path) -> Dict[str, str]:
+def build_activity_account_map(activity_path, idx: "EvidenceIndex" = None) -> Dict[str, str]:
     """Return resource_id → account_id mapping via system_activity batch correlation.
-    Uses the nearest PRECEDING account deletion (same day) to avoid false matches
-    when accounts are deleted after resource ops (different batches)."""
+
+    Uses evidence-aware ordered matching within each batch:
+    1. Group events into 2-hour batches
+    2. Within each batch, identify which resources belong to which user (via evidence index)
+    3. Sort users by their first resource sequence → match to accounts by deletion sequence
+    Falls back to proximity-based matching for resources not in the evidence index.
+    """
     acts = load_csv(activity_path)
     DELETION_OPS = {"DELETE_RECORD","ANONYMIZE_RECORD","REDACT_RECORD",
                     "DISABLE_DATA_FLOW","BLOCK_RESTORE","CHECK_DATA_FLOW"}
-    account_deletes: List[Tuple[str,str,int]] = []  # (time, account_id, seq)
-    other_ops: List[Tuple[str,str,int]] = []         # (time, resource_id, seq)
-    for i,a in enumerate(acts):
-        et=a.get("event_time",""); rid=a.get("resource_id","")
-        tsys=a.get("target_system",""); etype=a.get("event_type","")
-        if not et or not rid: continue
-        if tsys=="account_service" and etype=="DELETE_RECORD":
-            account_deletes.append((et,rid,i))
-        elif etype in DELETION_OPS and tsys not in ("account_service","email_delivery_service","cache_service","archive_service"):
-            other_ops.append((et,rid,i))
-    account_deletes.sort(); other_ops.sort()
-    res2acct: Dict[str,str] = {}
-    for ot,orid,oseq in other_ops:
-        day=ot[:10]
-        best_acct=None; best_dist=999999
-        for at,arid,aseq in account_deletes:
-            if at[:10]!=day: continue
-            if aseq >= oseq: continue   # account must be deleted BEFORE the resource op
-            dist=oseq-aseq
-            if dist<best_dist: best_dist=dist; best_acct=arid
-        if best_acct and best_dist<=300:
-            res2acct[orid]=best_acct
+
+    # Build resource→(emails,user_ids) from evidence index
+    rid2user: Dict[str, Tuple[List[str],List[str]]] = {}
+    if idx:
+        for rid, recs in idx._rid.items():
+            for rec in recs:
+                if rec.emails or rec.user_ids:
+                    rid2user[rid] = (rec.emails, rec.user_ids)
+                    break
+
+    # Group activities into time-based batches (2h gap = new batch)
+    BATCH_GAP_SECS = 7200
+    batches: List[List[Tuple]] = []  # each batch = list of (seq, event_time, resource_id, target_system, event_type)
+    current_batch: List[Tuple] = []
+    prev_t = None
+    for i, a in enumerate(acts):
+        et = a.get("event_time",""); rid = a.get("resource_id","")
+        tsys = a.get("target_system",""); etype = a.get("event_type","")
+        if not et: continue
+        t = parse_dt(et)
+        if t is None: continue
+        if prev_t and (t - prev_t).total_seconds() > BATCH_GAP_SECS:
+            if current_batch: batches.append(current_batch)
+            current_batch = []
+        current_batch.append((i, et, rid, tsys, etype))
+        prev_t = t
+    if current_batch: batches.append(current_batch)
+
+    res2acct: Dict[str, str] = {}
+
+    for batch in batches:
+        # Collect account deletions and non-account resource ops in this batch
+        acct_dels: List[Tuple[int,str]] = []   # (seq, account_rid)
+        res_ops: List[Tuple[int,str]] = []      # (seq, resource_rid)
+        for seq, et, rid, tsys, etype in batch:
+            if not rid: continue
+            if tsys == "account_service" and etype == "DELETE_RECORD":
+                acct_dels.append((seq, rid))
+            elif etype in DELETION_OPS and tsys not in ("account_service","email_delivery_service","cache_service","archive_service"):
+                res_ops.append((seq, rid))
+        if not acct_dels or not res_ops:
+            continue
+        acct_dels.sort()  # sorted by seq
+
+        if len(acct_dels) == 1:
+            # Single account: all resources → this account
+            for _, orid in res_ops:
+                res2acct[orid] = acct_dels[0][1]
+            continue
+
+        # Multiple accounts: use ordered matching via evidence index
+        # Step 1: find the "user fingerprint" of each resource from evidence index
+        # Step 2: determine the first-occurrence sequence per user fingerprint
+        # Step 3: sort user fingerprints by first-occurrence seq
+        # Step 4: match Nth fingerprint → Nth account
+
+        # User fingerprint = frozenset of (emails, user_ids) — identifies a unique user
+        fingerprint_first_seq: Dict[frozenset, int] = {}
+        rid_to_fingerprint: Dict[str, frozenset] = {}
+        for seq, orid in res_ops:
+            if orid in rid2user:
+                emails, uids = rid2user[orid]
+                fp = frozenset(emails + uids)
+                if fp:
+                    rid_to_fingerprint[orid] = fp
+                    if fp not in fingerprint_first_seq or seq < fingerprint_first_seq[fp]:
+                        fingerprint_first_seq[fp] = seq
+
+        if fingerprint_first_seq:
+            # Sort fingerprints by first appearance → assign to accounts in order
+            sorted_fps = sorted(fingerprint_first_seq.keys(), key=lambda fp: fingerprint_first_seq[fp])
+            fp_to_acct: Dict[frozenset, str] = {}
+            for rank, fp in enumerate(sorted_fps):
+                if rank < len(acct_dels):
+                    fp_to_acct[fp] = acct_dels[rank][1]
+            # Assign accounts to resources via fingerprint
+            for seq, orid in res_ops:
+                fp = rid_to_fingerprint.get(orid)
+                if fp and fp in fp_to_acct:
+                    res2acct[orid] = fp_to_acct[fp]
+                elif orid not in res2acct:
+                    # Fallback: nearest preceding account
+                    best_acct = None; best_dist = 999999
+                    for aseq, arid in acct_dels:
+                        if aseq >= seq: continue
+                        dist = seq - aseq
+                        if dist < best_dist: best_dist = dist; best_acct = arid
+                    if best_acct and best_dist <= 300:
+                        res2acct[orid] = best_acct
+        else:
+            # No indexed resources in this batch — fall back to proximity
+            for seq, orid in res_ops:
+                best_acct = None; best_dist = 999999
+                for aseq, arid in acct_dels:
+                    if aseq >= seq: continue
+                    dist = seq - aseq
+                    if dist < best_dist: best_dist = dist; best_acct = arid
+                if best_acct and best_dist <= 300:
+                    res2acct[orid] = best_acct
+
     return res2acct
 
 
@@ -974,11 +1155,13 @@ def generate_steps(records: List[Record], res2acct: Dict[str,str]=None,
         state=rec.state; ev=rec.file_id
         # Record type from parsed evidence overrides system-level default
         rec_type = rec.extra.get("record_type") if rec.extra else None
+        data_cat = rec.extra.get("data_category") if rec.extra else None  # PDF-parsed category
         email_opt_in = rec.extra.get("email_opt_in") if rec.extra else None
-        if rec_type:
+        if data_cat:
+            action = REQUIRED_ACTION.get(data_cat, REQUIRED_ACTION.get(SYSTEM_CATEGORY.get(sys_id,""),"DELETE"))
+        elif rec_type:
             action = REQUIRED_ACTION.get(rec_type, REQUIRED_ACTION.get(SYSTEM_CATEGORY.get(sys_id,""),"DELETE"))
         elif email_opt_in == "true":
-            # analytics contact/marketing record with email opt-in → DELETE
             action = "DELETE"
         else:
             action=REQUIRED_ACTION.get(SYSTEM_CATEGORY.get(sys_id,""),"DELETE")
@@ -1104,7 +1287,7 @@ def main():
 
     e2u, u2e, h2e = build_identity(identities, audit_log)
     idx = build_index(DATASET_DIR/"evidence_files.csv", h2e)
-    res2acct = build_activity_account_map(DATASET_DIR/"system_activity.csv")
+    res2acct = build_activity_account_map(DATASET_DIR/"system_activity.csv", idx)
     # Link anonymized analytics records to users via system_activity batch proximity
     analytics_map = build_analytics_user_map(str(DATASET_DIR/"system_activity.csv"), idx)
     for analytics_rid, (ae, au) in analytics_map.items():

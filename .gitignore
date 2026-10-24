@@ -6,6 +6,9 @@
 
 # Dataset (large files, personal data from challenge)
 dataset/
+# Allow sample files needed for CI
+!dataset/sample_deletion_requests.csv
+!dataset/sample_output.csv
 
 # Python
 __pycache__/
