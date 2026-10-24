@@ -2,1034 +2,745 @@
 """
 Deletion Audit Agent — Ghost Data Still Exists
 HackerRank Orchestrate Challenge, October 2026
+Rule-based deterministic agent — no external API required.
 """
 
-import os, csv, json, re, sys, sqlite3, logging, time
+import csv, json, re, sqlite3, logging
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from collections import defaultdict
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple
 
-REPO_ROOT = Path(__file__).parent.parent
+REPO_ROOT   = Path(__file__).parent.parent
 DATASET_DIR = REPO_ROOT / "dataset"
-EVIDENCE_DIR = DATASET_DIR / "evidence"
 OUTPUT_FILE = REPO_ROOT / "output.csv"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Policy tables
+# ─────────────────────────────────────────────────────────────────────────────
+
+SYSTEM_CATEGORY = {
+    "account_service":     "USER_PROFILE",
+    "search_service":      "SEARCH_INDEX_ENTRY",
+    "analytics_platform":  "ANALYTICS_PROFILE",
+    "support_platform":    "SUPPORT_MESSAGE",
+    "export_service":      "USER_EXPORT",
+    "integration_service": "INTEGRATION_FLOW",
+    "backup_service":      "BACKUP_ARCHIVE",
+    "security_service":    "SECURITY_AUDIT_LOG",
+    "identity_service":    "ACCOUNT_TOMBSTONE",
+    "marketing_platform":  "MARKETING_PROFILE",
+}
+
+REQUIRED_ACTION = {
+    "USER_PROFILE":        "DELETE",
+    "SECONDARY_IDENTIFIER":"DELETE",
+    "SEARCH_INDEX_ENTRY":  "DELETE",
+    "CACHE_ENTRY":         "DELETE",
+    "SUPPORT_MESSAGE":     "REDACT",
+    "SUPPORT_ATTACHMENT":  "DELETE",
+    "ANALYTICS_PROFILE":   "ANONYMIZE",
+    "PRODUCT_TELEMETRY":   "ANONYMIZE",
+    "USER_EXPORT":         "DELETE",
+    "MARKETING_PROFILE":   "DELETE",
+    "EMAIL_DELIVERY_LOG":  "REDACT",
+    "SECURITY_AUDIT_LOG":  "RETAIN",
+    "LEGAL_HOLD_RECORD":   "RETAIN",
+    "BACKUP_ARCHIVE":      "RETAIN",
+    "ACCOUNT_TOMBSTONE":   "REDACT",
+    "INTEGRATION_FLOW":    "DISABLE",
+}
+
+SYSTEM_ORDER = [
+    "account_service","analytics_platform","backup_service",
+    "export_service","identity_service","integration_service",
+    "marketing_platform","search_service","security_service",
+    "support_platform","unknown",
+]
+
+OP_ORDER = {
+    "FINDING":      {"REPORT_REMAINING_RECORD":0,"REPORT_EXPOSED_PII":1,"REPORT_ACTIVE_DATA_FLOW":2,"REPORT_RESTORE_RISK":3},
+    "REMEDIATION":  {"DISABLE_DATA_FLOW":0,"BLOCK_RESTORE":1,"DELETE_RECORD":2,"REDACT_RECORD":3,"ANONYMIZE_RECORD":4},
+    "VERIFICATION": {"VERIFY_RECORD_ABSENT":0,"VERIFY_RECORD_PRESENT":1,"VERIFY_RECORD_REDACTED":2,"VERIFY_RECORD_ANONYMIZED":3,"VERIFY_DATA_FLOW_DISABLED":4,"VERIFY_RESTORE_BLOCKED":5},
+}
+
+# result field → state
+RESULT_TO_STATE = {
+    "NOT_FOUND":   "ABSENT",
+    "FOUND":       "PRESENT",
+    "IDENTIFIABLE":"PRESENT",
+    "ANONYMIZED":  "ANONYMIZED",
+    "REDACTED":    "REDACTED",
+    "ACTIVE":      "ACTIVE",
+    "DISABLED":    "DISABLED",
+    "BLOCKED":     "BLOCKED",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_dt(s: str) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
+def parse_dt(s):
+    if not s: return None
+    try: return datetime.fromisoformat(s.replace("Z","+00:00"))
+    except: return None
 
-def norm_email(e: str) -> str:
-    return e.strip().lower() if e else ""
+def norm(e): return e.strip().lower() if e else ""
 
-def load_csv_rows(path: Path) -> List[Dict[str, str]]:
+def load_csv(path):
     with open(path, encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
 
+def sys_rank(s):
+    try: return SYSTEM_ORDER.index(s)
+    except: return len(SYSTEM_ORDER)
+
+def _jload(path):
+    try:
+        with open(path, encoding="utf-8") as f: return json.load(f)
+    except: return None
+
+def _is_email(s): return s and "@" in s
+def _is_uid(s):   return s and bool(re.match(r"user_\d+", s))
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Evidence Record
+# Evidence Record & Index
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Record:
     __slots__ = ("file_id","captured_at","system_id","resource_id","state","emails","user_ids","extra")
     def __init__(self, file_id, captured_at, system_id, resource_id, state,
                  emails=None, user_ids=None, extra=None):
-        self.file_id = file_id
-        self.captured_at = captured_at
-        self.system_id = system_id
-        self.resource_id = resource_id
-        self.state = state
-        self.emails = [norm_email(e) for e in (emails or []) if e]
-        self.user_ids = [u for u in (user_ids or []) if u]
-        self.extra = extra or {}
+        self.file_id=file_id; self.captured_at=captured_at
+        self.system_id=system_id; self.resource_id=resource_id; self.state=state
+        self.emails=[norm(e) for e in (emails or []) if e and _is_email(e)]
+        self.user_ids=[u for u in (user_ids or []) if u and _is_uid(u)]
+        self.extra=extra or {}
 
 class EvidenceIndex:
     def __init__(self):
-        self._by_email: Dict[str, List[Record]] = defaultdict(list)
-        self._by_user_id: Dict[str, List[Record]] = defaultdict(list)
-        self.file_meta: Dict[str, Dict] = {}
+        self._email: Dict[str,List[Record]] = defaultdict(list)
+        self._uid:   Dict[str,List[Record]] = defaultdict(list)
+        self._hash:  Dict[str,List[Record]] = defaultdict(list)  # email_hash → records
 
-    def add(self, rec: Record):
-        for e in rec.emails:
-            self._by_email[e].append(rec)
-        for u in rec.user_ids:
-            self._by_user_id[u].append(rec)
+    def add(self, rec, hashes=None):
+        for e in rec.emails:   self._email[e].append(rec)
+        for u in rec.user_ids: self._uid[u].append(rec)
+        for h in (hashes or []):
+            if h: self._hash[h].append(rec)
 
-    def find(self, emails: List[str], user_ids: List[str],
-             audit_at: Optional[datetime]) -> List[Record]:
-        seen = set()
-        results = []
-        cands = []
-        for e in emails:
-            cands.extend(self._by_email.get(norm_email(e), []))
-        for u in user_ids:
-            cands.extend(self._by_user_id.get(u, []))
+    def find(self, emails, user_ids, audit_at, hashes=None):
+        seen, results, cands = set(), [], []
+        for e in emails:    cands.extend(self._email.get(norm(e),[]))
+        for u in user_ids:  cands.extend(self._uid.get(u,[]))
+        for h in (hashes or []):
+            cands.extend(self._hash.get(h,[]))
         for rec in cands:
             key = (rec.file_id, rec.resource_id)
-            if key in seen:
-                continue
+            if key in seen: continue
             seen.add(key)
-            if audit_at is None or rec.captured_at <= audit_at:
+            if audit_at is None or rec.captured_at is None or rec.captured_at <= audit_at:
                 results.append(rec)
         return results
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Evidence Parsers
+# Generic Records Parser (handles most JSON evidence files)
+# Format: {"records": [{"system": ..., "resource_id": ..., "result": ..., "subject_reference": ...}]}
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _jload(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log.debug("JSON parse fail %s: %s", path.name, e)
-        return None
-
-
-def parse_handover_txt(file_id, captured_at, path, index: EvidenceIndex):
-    """Parse customer_account_handover_*.txt format:
-    - timestamp | system_id | resource_id | data_category | status | identifier
-    """
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        # Status mapping
-        STATUS_MAP = {
-            "NOT_FOUND": "ABSENT",
-            "FOUND": "PRESENT",
-            "IDENTIFIABLE": "PRESENT",  # PII exposed
-            "ANONYMIZED": "ANONYMIZED",
-            "ACTIVE": "ACTIVE",
-            "DISABLED": "DISABLED",
-            "BLOCKED": "BLOCKED",
-            "REDACTED": "REDACTED",
-        }
-        for line in text.splitlines():
-            line = line.strip()
-            if not line.startswith("- "):
-                continue
-            parts = [p.strip() for p in line[2:].split("|")]
-            if len(parts) < 6:
-                continue
-            ts, sys_id, rid, category, status_raw, identifier = parts[:6]
-            state = STATUS_MAP.get(status_raw.upper(), "PRESENT")
-            emails = []
-            user_ids = []
-            identifier = identifier.strip()
-            if "@" in identifier:
-                emails.append(identifier)
-            elif identifier.startswith("user_"):
-                user_ids.append(identifier)
-            elif identifier != "no direct identifier":
-                # Could be user_id or other
-                if re.match(r"user_\d+", identifier):
-                    user_ids.append(identifier)
-                else:
-                    emails.append(identifier)
-
-            rec = Record(file_id, captured_at, sys_id.strip(), rid.strip(),
-                         state, emails=emails, user_ids=user_ids,
-                         extra={"raw_status": status_raw, "category": category})
-            index.add(rec)
-    except Exception as e:
-        log.warning("Handover parse fail %s: %s", path.name, e)
-
-
-def parse_resource_lookup_log(file_id, captured_at, path, index: EvidenceIndex):
-    """Parse resource_lookup_trace_*.log files."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines()
-
-        # Index by trace_id to get paired debug+info lines
-        trace_pairs: Dict[str, Dict] = {}
-        for line in lines:
-            if "event=" not in line:
-                continue
-            tid_m = re.search(r"trace_id=(\S+)", line)
-            if not tid_m:
-                continue
-            tid = tid_m.group(1)
-            if tid not in trace_pairs:
-                trace_pairs[tid] = {}
-
-            # Extract fields
-            for key in ["service", "resource_id", "enabled", "restore_allowed",
-                        "customer_email", "customer_reference", "lookup_key",
-                        "requester_email", "email", "http_status", "rows",
-                        "last_delivery_status", "connector_name", "result",
-                        "subject_reference", "event_code"]:
-                m = re.search(rf"\b{key}=([^\s]+)", line)
-                if m:
-                    trace_pairs[tid][key] = m.group(1)
-
-        for tid, fields in trace_pairs.items():
-            rid = fields.get("resource_id")
-            if not rid:
-                continue
-
-            # Get system_id
-            sys_id = fields.get("service", "")
-            if not sys_id or sys_id not in {
-                "account_service", "search_service", "analytics_platform",
-                "support_platform", "export_service", "integration_service",
-                "backup_service", "security_service", "identity_service",
-                "marketing_platform"
-            }:
-                continue
-
-            # Collect identifiers
-            emails = []
-            user_ids = []
-            for k in ["lookup_key", "customer_email", "email", "requester_email"]:
-                v = fields.get(k, "")
-                if v and "@" in v and v != "null":
-                    emails.append(v)
-            for k in ["customer_reference", "subject_reference"]:
-                v = fields.get(k, "")
-                if v and v != "null" and v.startswith("user_"):
-                    user_ids.append(v)
-
-            if not emails and not user_ids:
-                continue
-
-            # Determine state
-            http_status = fields.get("http_status", "")
-            rows = fields.get("rows", "")
-            enabled = fields.get("enabled", "")
-            restore_allowed = fields.get("restore_allowed", "")
-            result = fields.get("result", "")
-
-            if http_status == "404" or rows == "0":
-                state = "ABSENT"
-            elif enabled == "false" or fields.get("last_delivery_status") == "stopped":
-                state = "DISABLED"
-            elif restore_allowed == "false":
-                state = "BLOCKED"
-            elif enabled == "true":
-                state = "ACTIVE"
-            elif restore_allowed == "true":
-                state = "ACTIVE"
-            elif result == "hit":
-                state = "PRESENT"
-            elif sys_id == "analytics_platform":
-                # Check if any PII fields are set
-                has_pii = any(f in str(fields) for f in ["email=", "phone="])
-                state = "PRESENT" if has_pii else "ANONYMIZED"
-            else:
-                state = "PRESENT"
-
-            # For security_service, always PRESENT
-            if sys_id == "security_service":
-                state = "PRESENT"
-
-            rec = Record(file_id, captured_at, sys_id, rid, state,
-                         emails=emails, user_ids=user_ids, extra=fields)
-            index.add(rec)
-    except Exception as e:
-        log.warning("Log parse fail %s: %s", path.name, e)
-
-
-def parse_service_events_log(file_id, captured_at, path, index: EvidenceIndex):
-    """Parse service_events_*.log and similar operational logs."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line in text.splitlines():
-            # Look for lines with resource_id and an identifier
-            rid_m = re.search(r"resource_id=([a-zA-Z_][a-zA-Z0-9_]*)", line)
-            if not rid_m:
-                continue
-            rid = rid_m.group(1)
-
-            emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", line)
-            user_ids = re.findall(r"\buser_\d+\b", line)
-
-            if not (emails or user_ids):
-                continue
-
-            sys_m = re.search(r"service=([a-zA-Z_]+)", line)
-            sys_id = sys_m.group(1) if sys_m else "unknown"
-
-            state = "PRESENT"
-            if "deleted" in line.lower() or "absent" in line.lower():
-                state = "ABSENT"
-            elif "anonymized" in line.lower():
-                state = "ANONYMIZED"
-            elif "redacted" in line.lower():
-                state = "REDACTED"
-
-            rec = Record(file_id, captured_at, sys_id, rid, state,
-                         emails=list(set(emails)), user_ids=list(set(user_ids)))
-            index.add(rec)
-    except Exception as e:
-        log.debug("Service events log parse fail %s: %s", path.name, e)
-
-
-def parse_service_resource_export_json(file_id, captured_at, path, index: EvidenceIndex):
-    """Parse service_resource_export_*.json files."""
-    data = _jload(path)
-    if not data or "service_exports" not in data:
-        return
-    exports = data["service_exports"]
-
-    # account_service
-    for e in exports.get("account_service", {}).get("profile_lookups", []):
-        rid = e.get("resource_id"); status = e.get("status_code", 0)
-        profile = e.get("profile") or {}
-        emails = [v for k, v in profile.items() if k == "email" and v]
-        user_ids = [v for k, v in profile.items() if k == "customer_reference" and v]
-        state = "ABSENT" if status == 404 else "PRESENT"
-        if rid:
-            index.add(Record(file_id, captured_at, "account_service", rid, state,
-                             emails=emails, user_ids=user_ids))
-
-    # analytics_platform
-    for e in exports.get("analytics_platform", {}).get("profiles", []):
-        rid = e.get("resource_id")
-        emails = [v for k, v in e.items() if k == "email" and v]
-        user_ids = [v for k, v in e.items() if k == "customer_reference" and v]
-        has_pii = any(e.get(k) for k in ["email", "phone", "email_hash"])
-        state = "PRESENT" if has_pii else "ANONYMIZED"
-        if rid:
-            index.add(Record(file_id, captured_at, "analytics_platform", rid, state,
-                             emails=emails, user_ids=user_ids))
-
-    # backup_service
-    for e in exports.get("backup_service", {}).get("restore_entries", []):
-        rid = e.get("resource_id")
-        emails = [v for k, v in e.items() if k == "customer_email" and v]
-        user_ids = [v for k, v in e.items() if k == "customer_reference" and v]
-        state = "ACTIVE" if e.get("restore_allowed") else "BLOCKED"
-        if rid:
-            index.add(Record(file_id, captured_at, "backup_service", rid, state,
-                             emails=emails, user_ids=user_ids))
-
-    # export_service
-    for e in exports.get("export_service", {}).get("exports", []):
-        rid = e.get("resource_id")
-        emails = [v for k, v in e.items() if k in ["owner_email"] and v]
-        user_ids = [v for k, v in e.items() if k == "customer_reference" and v]
-        if rid and (emails or user_ids):
-            index.add(Record(file_id, captured_at, "export_service", rid, "PRESENT",
-                             emails=emails, user_ids=user_ids))
-
-    # integration_service
-    for e in exports.get("integration_service", {}).get("connectors", []):
-        rid = e.get("resource_id")
-        emails = [v for k, v in e.items() if k == "customer_email" and v]
-        user_ids = [v for k, v in e.items() if k == "customer_reference" and v]
-        state = "ACTIVE" if e.get("enabled") else "DISABLED"
-        if rid and (emails or user_ids):
-            index.add(Record(file_id, captured_at, "integration_service", rid, state,
-                             emails=emails, user_ids=user_ids,
-                             extra={"connector_name": e.get("connector_name")}))
-
-    # search_service
-    for e in exports.get("search_service", {}).get("index_queries", []):
-        rid = e.get("resource_id")
-        hits = e.get("hits", {})
-        docs = hits.get("documents", [])
-        emails = [d.get("email") for d in docs if d.get("email")]
-        user_ids = [d.get("customer_reference") for d in docs if d.get("customer_reference")]
-        state = "PRESENT" if hits.get("total", 0) > 0 else "ABSENT"
-        if rid and (emails or user_ids):
-            index.add(Record(file_id, captured_at, "search_service", rid, state,
-                             emails=emails, user_ids=user_ids))
-
-    # support_platform
-    for e in exports.get("support_platform", {}).get("tickets", []):
-        rid = e.get("resource_id")
-        emails = [v for k, v in e.items() if k == "requester_email" and v]
-        user_ids = [v for k, v in e.items() if k == "customer_reference" and v]
-        has_pii = any(e.get(k) for k in ["requester_email", "requester_name", "requester_phone"])
-        state = "PRESENT" if has_pii else "REDACTED"
-        if rid and (emails or user_ids):
-            index.add(Record(file_id, captured_at, "support_platform", rid, state,
-                             emails=emails, user_ids=user_ids))
-
-    # identity_service
-    for e in exports.get("identity_service", {}).get("tombstones", []):
-        rid = e.get("resource_id")
-        emails = [v for k, v in e.items() if k == "email" and v]
-        user_ids = [v for k, v in e.items() if k in ["user_id", "customer_reference"] and v]
-        has_pii = any(e.get(k) for k in ["email", "full_name", "phone"])
-        state = "PRESENT" if has_pii else "REDACTED"
-        if rid and (emails or user_ids):
-            index.add(Record(file_id, captured_at, "identity_service", rid, state,
-                             emails=emails, user_ids=user_ids))
-
-    # marketing_platform
-    for e in exports.get("marketing_platform", {}).get("profiles", []):
-        rid = e.get("resource_id")
-        emails = [v for k, v in e.items() if k in ["email", "customer_email"] and v]
-        user_ids = [v for k, v in e.items() if k == "customer_reference" and v]
-        if rid and (emails or user_ids):
-            index.add(Record(file_id, captured_at, "marketing_platform", rid, "PRESENT",
-                             emails=emails, user_ids=user_ids))
-
-
-def parse_snapshot_bundle_json(file_id, captured_at, path, index: EvidenceIndex):
-    data = _jload(path)
-    if not data:
-        return
-    for snap in data.get("snapshots", []):
-        store = snap.get("data_store", "")
-        for r in snap.get("records", []):
-            rid = r.get("resource_id")
-            if not rid:
-                continue
-            emails = [v for k, v in r.items()
-                      if k in ["email","requester_email","owner_email","customer_email"] and v]
-            user_ids = [v for k, v in r.items()
-                        if k in ["customer_reference","user_id"] and v]
-            if not (emails or user_ids):
-                continue
-            account_status = r.get("account_status", "")
-            state = "ABSENT" if account_status in ("DELETED",) else "PRESENT"
-            index.add(Record(file_id, captured_at, store or "unknown", rid, state,
-                             emails=emails, user_ids=user_ids, extra=r))
-
-
-def parse_security_audit_json(file_id, captured_at, path, index: EvidenceIndex):
-    data = _jload(path)
-    if not data:
-        return
+def parse_generic_records(fid, cat, data, idx):
+    """Parse any JSON file whose top-level 'records' array contains
+    system/resource_id/result/subject_reference rows."""
     for r in data.get("records", []):
-        rid = r.get("resource_id")
-        subject = r.get("subject_reference", "")
-        if not rid:
-            continue
-        emails = [subject] if "@" in subject else []
-        user_ids = [subject] if subject.startswith("user_") else []
-        result = r.get("result", "FOUND")
-        state = "PRESENT" if result == "FOUND" else "ABSENT"
-        index.add(Record(file_id, captured_at, "security_service", rid, state,
-                         emails=emails, user_ids=user_ids, extra=r))
+        rid    = r.get("resource_id")
+        sys_id = r.get("system", "unknown")
+        subj   = r.get("subject_reference", "") or ""
+        result = r.get("result", "")
+        state  = RESULT_TO_STATE.get(result, "PRESENT") if result else "PRESENT"
+        if not rid: continue
+        emails   = [subj] if _is_email(subj) else []
+        user_ids = [subj] if _is_uid(subj) else []
+        if not (emails or user_ids): continue
+        idx.add(Record(fid, cat, sys_id, rid, state, emails=emails, user_ids=user_ids))
 
 
-def parse_analytics_json(file_id, captured_at, path, index: EvidenceIndex):
-    data = _jload(path)
-    if not data:
-        return
-    for r in data.get("profiles", []):
-        rid = r.get("resource_id")
-        if not rid:
-            continue
-        emails = [r.get("email")] if r.get("email") else []
-        user_ids = [v for k, v in r.items() if k in ["user_id","customer_reference"] and v]
+def parse_export_jobs_records(fid, cat, data, idx):
+    """Parse customer_export_jobs JSON: records with owner_email, download_available."""
+    for r in data.get("records", []):
+        rid   = r.get("resource_id")
+        email = r.get("owner_email", "")
+        subj  = r.get("customer_reference", "")
+        if not rid or not (email or subj): continue
+        avail = r.get("download_available", True)
+        state = "PRESENT" if avail else "ABSENT"
+        idx.add(Record(fid, cat, "export_service", rid, state,
+                       emails=[email] if email else [],
+                       user_ids=[subj] if _is_uid(subj) else []))
+
+
+def parse_analytics_records(fid, cat, data, idx):
+    """Parse customer_analytics_report JSON: records with user_id/email/email_hash."""
+    for r in data.get("records", []):
+        rid    = r.get("resource_id")
+        email  = r.get("email", "") or ""
+        uid    = r.get("user_id", "") or ""
+        ehash  = r.get("email_hash", "") or ""
+        if not rid: continue
         has_pii = any(r.get(k) for k in ["email","phone","email_hash"])
-        state = "PRESENT" if has_pii else "ANONYMIZED"
-        if emails or user_ids:
-            index.add(Record(file_id, captured_at, "analytics_platform", rid, state,
-                             emails=emails, user_ids=user_ids))
-
-
-def parse_export_jobs_json(file_id, captured_at, path, index: EvidenceIndex):
-    data = _jload(path)
-    if not data:
-        return
-    for job in data.get("jobs", []):
-        rid = job.get("resource_id")
-        if not rid:
-            continue
-        emails = [v for k, v in job.items() if k in ["owner_email","requester_email"] and v]
-        user_ids = [v for k, v in job.items() if k in ["customer_reference","user_id"] and v]
-        status = job.get("status", "")
-        state = "ABSENT" if status in ("DELETED","EXPIRED") else "PRESENT"
-        if emails or user_ids:
-            index.add(Record(file_id, captured_at, "export_service", rid, state,
-                             emails=emails, user_ids=user_ids))
-
-
-def parse_connector_json(file_id, captured_at, path, index: EvidenceIndex):
-    data = _jload(path)
-    if not data:
-        return
-    for conn in data.get("connectors", []):
-        rid = conn.get("resource_id")
-        if not rid:
-            continue
-        emails = [v for k, v in conn.items() if k == "customer_email" and v]
-        user_ids = [v for k, v in conn.items() if k == "customer_reference" and v]
-        state = "ACTIVE" if conn.get("enabled") else "DISABLED"
-        if emails or user_ids:
-            index.add(Record(file_id, captured_at, "integration_service", rid, state,
-                             emails=emails, user_ids=user_ids,
-                             extra={"connector_name": conn.get("connector_name")}))
-
-
-def parse_export_manifest_json(file_id, captured_at, path, index: EvidenceIndex):
-    data = _jload(path)
-    if not data:
-        return
-    for e in data.get("exports", []):
-        rid = e.get("resource_id")
-        emails = [v for k, v in e.items() if k == "owner_email" and v]
-        user_ids = [v for k, v in e.items() if k == "customer_reference" and v]
-        if rid and (emails or user_ids):
-            index.add(Record(file_id, captured_at, "export_service", rid, "PRESENT",
-                             emails=emails, user_ids=user_ids))
-
-
-def parse_generic_json(file_id, captured_at, path, index: EvidenceIndex):
-    """Scan JSON for any resource_id + email combinations."""
-    data = _jload(path)
-    if not data:
-        return
-
-    def scan(obj, sys_hint="unknown"):
-        if isinstance(obj, dict):
-            rid = obj.get("resource_id")
-            if rid:
-                emails = [v for k, v in obj.items()
-                          if k in ["email","customer_email","owner_email","requester_email"] and v and "@" in str(v)]
-                user_ids = [v for k, v in obj.items()
-                            if k in ["user_id","customer_reference","subject_reference"] and v]
-                if emails or user_ids:
-                    sys_id = sys_hint if sys_hint != "unknown" else "unknown"
-                    for keyword, sid in [("account",  "account_service"),
-                                         ("search",   "search_service"),
-                                         ("analytics","analytics_platform"),
-                                         ("support",  "support_platform"),
-                                         ("export",   "export_service"),
-                                         ("data_flow","integration_service"),
-                                         ("backup",   "backup_service"),
-                                         ("audit_record","security_service"),
-                                         ("tombstone","identity_service"),
-                                         ("marketing","marketing_platform")]:
-                        if keyword in rid.lower():
-                            sys_id = sid
-                            break
-                    state = "PRESENT"
-                    index.add(Record(file_id, captured_at, sys_id, rid, state,
-                                     emails=emails, user_ids=user_ids))
-            for v in obj.values():
-                if isinstance(v, (dict, list)):
-                    scan(v, sys_hint)
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, (dict, list)):
-                    scan(item, sys_hint)
-    scan(data)
-
-
-def parse_sql_inventory(file_id, captured_at, path, index: EvidenceIndex):
-    try:
-        sql = path.read_text(encoding="utf-8")
-        conn = sqlite3.connect(":memory:")
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.executescript(sql)
-
-        TABLE_SYSTEM = {
-            "customer_profiles": "account_service",
-            "customer_search_documents": "search_service",
-            "customer_analytics_profiles": "analytics_platform",
-            "support_records": "support_platform",
-            "customer_exports": "export_service",
-            "connector_subscriptions": "integration_service",
-            "backup_restore_entries": "backup_service",
-            "security_audit_records": "security_service",
-        }
-
-        for tbl, sys_id in TABLE_SYSTEM.items():
-            try:
-                rows = conn.execute(f"SELECT * FROM {tbl}").fetchall()
-                desc = [d[0] for d in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]
-                desc_names = [d[1] for d in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]
-                rows = conn.execute(f"SELECT * FROM {tbl}").fetchall()
-                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")]
-                rows = conn.execute(f"SELECT * FROM {tbl}").fetchall()
-                for row in rows:
-                    r = dict(zip(cols, row))
-                    rid = r.get("resource_id")
-                    if not rid:
-                        continue
-                    emails = [v for k, v in r.items()
-                              if k in ["email","requester_email","owner_email","customer_email"] and v and "@" in str(v)]
-                    user_ids = [v for k, v in r.items()
-                                if k in ["customer_reference","user_id","subject_reference"] and v
-                                and "@" not in str(v)]
-                    if not (emails or user_ids):
-                        continue
-                    # Determine state
-                    if tbl == "backup_restore_entries":
-                        state = "ACTIVE" if r.get("restore_allowed") == 1 else "BLOCKED"
-                    elif tbl == "connector_subscriptions":
-                        state = "ACTIVE" if r.get("enabled") == 1 else "DISABLED"
-                    elif tbl == "security_audit_records":
-                        state = "PRESENT"
-                    elif r.get("account_status") in ("DELETED",):
-                        state = "ABSENT"
-                    else:
-                        state = "PRESENT"
-                    index.add(Record(file_id, captured_at, sys_id, rid, state,
-                                     emails=emails, user_ids=user_ids, extra=r))
-            except Exception:
-                pass
-        conn.close()
-    except Exception as e:
-        log.warning("SQL inventory parse fail %s: %s", path.name, e)
-
-
-def parse_sql_read_replica(file_id, captured_at, path, index: EvidenceIndex):
-    try:
-        sql = path.read_text(encoding="utf-8")
-        conn = sqlite3.connect(":memory:")
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.executescript(sql)
-        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-        for tbl in tables:
-            if tbl in ("snapshot_scope",):
-                continue
-            try:
-                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")]
-                rows = conn.execute(f"SELECT * FROM {tbl}").fetchall()
-                for row in rows:
-                    r = dict(zip(cols, row))
-                    rid = r.get("resource_id")
-                    if not rid:
-                        continue
-                    # Handle JSON-encoded record
-                    record_json_str = r.get("record_json", "")
-                    if record_json_str:
-                        try:
-                            rj = json.loads(record_json_str)
-                            emails = [rj.get(k) for k in ["email","requester_email"] if rj.get(k)]
-                            user_ids = [rj.get(k) for k in ["user_id","customer_reference"] if rj.get(k)]
-                            origin = r.get("origin_system", "unknown")
-                            if emails or user_ids:
-                                state = "PRESENT"
-                                if not any(rj.get(k) for k in ["email","phone","email_hash"]) and origin == "analytics_platform":
-                                    state = "ANONYMIZED"
-                                index.add(Record(file_id, captured_at, origin, rid, state,
-                                                 emails=emails, user_ids=user_ids, extra=rj))
-                        except Exception:
-                            pass
-                    else:
-                        emails = [v for k, v in r.items()
-                                  if k in ["email","requester_email"] and v and "@" in str(v)]
-                        user_ids = [v for k, v in r.items()
-                                    if k in ["user_id","customer_reference"] and v and "@" not in str(v)]
-                        if emails or user_ids:
-                            origin = r.get("origin_system", "unknown")
-                            index.add(Record(file_id, captured_at, origin, rid, "PRESENT",
-                                             emails=emails, user_ids=user_ids, extra=r))
-            except Exception:
-                pass
-        conn.close()
-    except Exception as e:
-        log.warning("SQL replica parse fail %s: %s", path.name, e)
-
-
-def parse_sql_generic(file_id, captured_at, path, index: EvidenceIndex):
-    try:
-        sql = path.read_text(encoding="utf-8")
-        conn = sqlite3.connect(":memory:")
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.executescript(sql)
-        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-        for tbl in tables:
-            if tbl in ("snapshot_scope",):
-                continue
-            try:
-                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")]
-                rows = conn.execute(f"SELECT * FROM {tbl}").fetchall()
-                for row in rows:
-                    r = dict(zip(cols, row))
-                    rid = r.get("resource_id")
-                    if not rid:
-                        continue
-                    emails = [v for k, v in r.items()
-                              if k in ["email","user_email","requester_email","owner_email","customer_email"] and v and "@" in str(v)]
-                    user_ids = [v for k, v in r.items()
-                                if k in ["user_id","customer_reference","subject_reference"] and v and "@" not in str(v)]
-                    if not (emails or user_ids):
-                        continue
-                    # Infer system from rid prefix
-                    sys_id = "unknown"
-                    for keyword, sid in [("account","account_service"),("search","search_service"),
-                                         ("analytics","analytics_platform"),("support","support_platform"),
-                                         ("export","export_service"),("data_flow","integration_service"),
-                                         ("backup","backup_service"),("audit_record","security_service"),
-                                         ("tombstone","identity_service"),("marketing","marketing_platform")]:
-                        if keyword in rid.lower():
-                            sys_id = sid
-                            break
-                    state = "PRESENT"
-                    if r.get("restore_allowed") == 0:
-                        state = "BLOCKED"
-                    elif r.get("restore_allowed") == 1:
-                        state = "ACTIVE"
-                    elif r.get("enabled") == 0:
-                        state = "DISABLED"
-                    elif r.get("enabled") == 1:
-                        state = "ACTIVE"
-                    index.add(Record(file_id, captured_at, sys_id, rid, state,
-                                     emails=emails, user_ids=user_ids, extra=r))
-            except Exception:
-                pass
-        conn.close()
-    except Exception as e:
-        log.warning("SQL generic parse fail %s: %s", path.name, e)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Build Evidence Index
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_evidence_index(evidence_csv: Path) -> EvidenceIndex:
-    index = EvidenceIndex()
-    rows = load_csv_rows(evidence_csv)
-    log.info("Indexing %d evidence files...", len(rows))
-    for row in rows:
-        file_id = row["file_id"]
-        rel_path = row["file_path"]
-        captured_at = parse_dt(row["captured_at"])
-        path = DATASET_DIR / rel_path
-        if not path.exists():
-            continue
-        index.file_meta[file_id] = {"path": str(path), "captured_at": captured_at}
-        fname = path.name.lower()
-        suffix = path.suffix.lower()
-        try:
-            if suffix == ".txt":
-                parse_handover_txt(file_id, captured_at, path, index)
-            elif suffix == ".json":
-                if "service_resource_export" in fname:
-                    parse_service_resource_export_json(file_id, captured_at, path, index)
-                elif "snapshot_bundle" in fname:
-                    parse_snapshot_bundle_json(file_id, captured_at, path, index)
-                elif "security_audit" in fname or "audit_ledger" in fname:
-                    parse_security_audit_json(file_id, captured_at, path, index)
-                elif "analytics_report" in fname:
-                    parse_analytics_json(file_id, captured_at, path, index)
-                elif "export_jobs" in fname:
-                    parse_export_jobs_json(file_id, captured_at, path, index)
-                elif "connector" in fname:
-                    parse_connector_json(file_id, captured_at, path, index)
-                elif "export_manifest" in fname:
-                    parse_export_manifest_json(file_id, captured_at, path, index)
-                else:
-                    parse_generic_json(file_id, captured_at, path, index)
-            elif suffix == ".sql":
-                if "inventory" in fname:
-                    parse_sql_inventory(file_id, captured_at, path, index)
-                elif "read_replica" in fname:
-                    parse_sql_read_replica(file_id, captured_at, path, index)
-                else:
-                    parse_sql_generic(file_id, captured_at, path, index)
-            elif suffix == ".log":
-                if "resource_lookup_trace" in fname:
-                    parse_resource_lookup_log(file_id, captured_at, path, index)
-                else:
-                    parse_service_events_log(file_id, captured_at, path, index)
-        except Exception as e:
-            log.warning("Error indexing %s: %s", file_id, e)
-
-    total = sum(len(v) for v in index._by_email.values())
-    log.info("Index: %d email entries, %d user_id entries",
-             len(index._by_email), len(index._by_user_id))
-    return index
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Identity Resolution
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_identity_maps(user_identities, user_audit_log):
-    email_to_user: Dict[str, Dict] = {}
-    user_id_to_emails: Dict[str, List[str]] = defaultdict(list)
-
-    for u in user_identities:
-        e = norm_email(u.get("email", ""))
-        uid = u.get("user_id", "")
-        if e:
-            email_to_user[e] = u
-        if uid and e:
-            if e not in user_id_to_emails[uid]:
-                user_id_to_emails[uid].append(e)
-
-    for entry in user_audit_log:
-        uid = entry.get("user_id", "")
-        field = entry.get("field_name", "")
-        if field != "email":
-            continue
-        for val in [entry.get("old_value", ""), entry.get("new_value", "")]:
-            e = norm_email(val)
-            if e and e not in user_id_to_emails[uid]:
-                user_id_to_emails[uid].append(e)
-            if e and e not in email_to_user:
-                # Link old email to the user
-                for ce in user_id_to_emails[uid]:
-                    if ce in email_to_user:
-                        email_to_user[e] = email_to_user[ce]
-                        break
-
-    return email_to_user, user_id_to_emails
-
-
-def resolve_identity(request_email, email_to_user, user_id_to_emails):
-    norm = norm_email(request_email)
-    user = email_to_user.get(norm)
-    if user:
-        uid = user.get("user_id", "")
-        all_emails = list(user_id_to_emails.get(uid, [norm]))
-        return uid, list(set(all_emails + [norm]))
-    for uid, emails in user_id_to_emails.items():
-        if norm in [norm_email(e) for e in emails]:
-            return uid, list(set(emails + [norm]))
-    return None, [norm]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Deletion Request Classifier
-# ─────────────────────────────────────────────────────────────────────────────
-
-DELETION_PATTERNS = [
-    r"\bdelete\b", r"\bdeletion\b", r"\berase\b", r"\berasure\b",
-    r"\bremove\b.*\b(account|data|profile|personal)\b",
-    r"\b(account|data|profile)\b.*\bremove\b",
-    r"\bclose.*account\b", r"\baccount.*clos",
-    r"\bpermanent", r"\bright to be forgotten\b",
-    r"\bwipe\b.*\bdata\b", r"\bdelete.*profile\b",
-    r"\berased\b", r"\blöschen\b", r"\bsuppression\b",
-    r"supprim", r"\beffacer\b",  # French
-    r"\bborrar\b", r"\beliminar\b",  # Spanish
-    r"\b削除\b",  # Japanese
-    r"\blösch",  # German
-]
-
-NON_DELETION_PATTERNS = [
-    r"^(?!.*(?:delete|erase|remove.*account|close.*account|deletion|erasure)).*(?:export|download|copy of|access to|access my data|data access|request.{0,20}copy)\b",
-    r"^(?!.*(?:delete|erase|remove|close)).*\bunsubscribe\b",
-    r"^(?!.*(?:delete|erase|remove|close)).*\bopt.?out\b.*\bmarket",
-    r"^(?!.*(?:delete|erase|remove|close)).*\bcorrect\b",
-]
-
-def is_deletion_request(text: str) -> bool:
-    if not text:
-        return False
-    tl = text.lower()
-    for p in DELETION_PATTERNS:
-        if re.search(p, tl):
-            return True
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# System Activity
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_system_activity(path: Path) -> List[Dict]:
-    return load_csv_rows(path)
-
-
-def filter_activity_for_case(activities: List[Dict], resource_ids: set,
-                              requested_at: Optional[datetime],
-                              audit_at: Optional[datetime]) -> List[Dict]:
-    """Return activity records relevant to this case (by resource_id or timing)."""
-    relevant = []
-    for act in activities:
-        rid = act.get("resource_id", "")
-        et = parse_dt(act.get("event_time", ""))
-        if not et:
-            continue
-        # Filter by time window
-        if audit_at and et > audit_at:
-            continue
-        if rid in resource_ids:
-            relevant.append(act)
-    return relevant
-
-
-def get_deletion_activities(activities: List[Dict],
-                             requested_at: Optional[datetime],
-                             audit_at: Optional[datetime]) -> List[Dict]:
-    """Get deletion-related activities in the time window."""
-    deletion_types = {"DELETE_RECORD", "ANONYMIZE_RECORD", "REDACT_RECORD",
-                      "BLOCK_RESTORE", "DISABLE_DATA_FLOW"}
-    results = []
-    for act in activities:
-        et = parse_dt(act.get("event_time", ""))
-        if not et:
-            continue
-        if requested_at and et < requested_at:
-            continue
-        if audit_at and et > audit_at:
-            continue
-        if act.get("event_type") in deletion_types:
-            results.append(act)
-    return results
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Claude Integration
-# ─────────────────────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are a privacy deletion audit agent for Northstar Shop. Analyze evidence and produce structured JSON audit steps.
-
-=== DELETION RULES ===
-system_id -> required_action:
-- account_service (USER_PROFILE): DELETE -> state=ABSENT
-- search_service (SEARCH_INDEX_ENTRY): DELETE -> state=ABSENT
-- analytics_platform (ANALYTICS_PROFILE): ANONYMIZE -> state=ANONYMIZED (null identifiers)
-- support_platform (SUPPORT_MESSAGE): REDACT if shared context, DELETE if subject-only -> state=REDACTED or ABSENT
-- export_service (USER_EXPORT): DELETE -> state=ABSENT
-- marketing_platform (MARKETING_PROFILE): DELETE -> state=ABSENT
-- integration_service data flows: DISABLE_DATA_FLOW -> state=DISABLED (then DELETE)
-- backup_service (BACKUP_ARCHIVE): RETAIN but BLOCK restore -> state=BLOCKED
-- security_service (SECURITY_AUDIT_LOG): RETAIN -> state=PRESENT (never delete)
-- identity_service (ACCOUNT_TOMBSTONE): REDACT (keep user_id, remove name/email/phone) -> state=REDACTED
-
-=== STEP FORMAT ===
-{"step_no":1,"phase":"FINDING","system_id":"account_service","resource_id":"account_001","operation":"REPORT_REMAINING_RECORD","state":"PRESENT","evidence_id":"evidence_54"}
-
-=== PHASES AND OPERATIONS ===
-FINDING: REPORT_REMAINING_RECORD, REPORT_EXPOSED_PII, REPORT_ACTIVE_DATA_FLOW, REPORT_RESTORE_RISK
-REMEDIATION: DISABLE_DATA_FLOW, BLOCK_RESTORE, DELETE_RECORD, REDACT_RECORD, ANONYMIZE_RECORD
-VERIFICATION: VERIFY_RECORD_ABSENT, VERIFY_RECORD_PRESENT, VERIFY_RECORD_REDACTED, VERIFY_RECORD_ANONYMIZED, VERIFY_DATA_FLOW_DISABLED, VERIFY_RESTORE_BLOCKED
-
-=== ORDERING RULES ===
-Phase order: FINDING → REMEDIATION → VERIFICATION
-Within FINDING: operation order as listed above, then system_id asc, then resource_id asc
-Within REMEDIATION: DISABLE_DATA_FLOW and BLOCK_RESTORE before DELETE/REDACT/ANONYMIZE
-Within VERIFICATION: operation order as listed above, then system_id asc, then resource_id asc
-
-=== DECISION RULES ===
-1. NOT_APPLICABLE: request_text does NOT authorize deletion → return []
-   - Access, export, correction, marketing opt-out are NOT deletion
-2. INCOMPLETE: records still present that should be absent/anonymized/redacted, OR active data flows/restore risks
-3. COMPLETE: all required treatments verified by evidence, no remaining issues
-
-=== EVIDENCE RULES ===
-- COMPLETE case: EVERY step cites an evidence_id (file_id from evidence)
-- INCOMPLETE FINDING steps: cite evidence_id proving the problem
-- INCOMPLETE REMEDIATION steps: evidence_id=""
-- INCOMPLETE post-remediation VERIFICATION steps: evidence_id=""
-- ONLY cite evidence captured at or before audit_at
-
-=== MANDATORY STEPS ===
-For any deletion case with evidence:
-- Always VERIFY_RECORD_ABSENT for account_service (the account profile)
-- Always VERIFY_RECORD_PRESENT for security_service audit record (must be retained)
-- For each anonymized analytics record: VERIFY_RECORD_ANONYMIZED
-- For each redacted support record: VERIFY_RECORD_REDACTED
-- For each disabled data flow: VERIFY_DATA_FLOW_DISABLED
-- For each blocked backup: VERIFY_RESTORE_BLOCKED
-
-=== EVIDENCE STATE MEANINGS ===
-- ABSENT/NOT_FOUND/404: record deleted → VERIFY_RECORD_ABSENT
-- PRESENT/FOUND/IDENTIFIABLE: record still has PII → REPORT_REMAINING_RECORD or REPORT_EXPOSED_PII
-- ANONYMIZED: PII removed → VERIFY_RECORD_ANONYMIZED
-- REDACTED: identifiers removed → VERIFY_RECORD_REDACTED
-- ACTIVE (data flow): still running → REPORT_ACTIVE_DATA_FLOW
-- DISABLED: stopped → VERIFY_DATA_FLOW_DISABLED
-- ACTIVE (backup): restore possible → REPORT_RESTORE_RISK
-- BLOCKED: restore prevented → VERIFY_RESTORE_BLOCKED
-
-Return ONLY valid JSON:
-{"deletion_status":"COMPLETE"|"INCOMPLETE"|"NOT_APPLICABLE","steps":[...]}"""
-
-
-def format_records_for_prompt(records: List[Record]) -> str:
-    if not records:
-        return "None found in evidence."
-    lines = []
-    by_sys = defaultdict(list)
-    for r in records:
-        by_sys[r.system_id].append(r)
-    for sys_id in sorted(by_sys.keys()):
-        lines.append(f"[{sys_id}]")
-        for r in sorted(by_sys[sys_id], key=lambda x: (x.resource_id, str(x.captured_at))):
-            dt = r.captured_at.strftime("%Y-%m-%dT%H:%M:%SZ") if r.captured_at else "?"
-            extra = ""
-            if sys_id == "integration_service" and r.extra.get("connector_name"):
-                extra = f" ({r.extra['connector_name']})"
-            lines.append(f"  {r.resource_id}: state={r.state}{extra} | evidence={r.file_id} | captured={dt}")
-    return "\n".join(lines)
-
-
-def call_claude(client, case: Dict, user_id: Optional[str],
-                all_emails: List[str], records: List[Record],
-                is_deletion: bool, deletion_activities: List[Dict],
-                usage_tracker: List) -> Dict:
-    from anthropic import Anthropic
-
-    if not is_deletion:
-        return {"deletion_status": "NOT_APPLICABLE", "steps": []}
-
-    records_text = format_records_for_prompt(records)
-
-    # Format relevant activities
-    act_lines = []
-    for act in deletion_activities[:30]:
-        act_lines.append(
-            f"  {act['event_time']} | {act['event_type']} | {act.get('source_system','')} → "
-            f"{act.get('target_system','')} | {act['resource_id']} | {act.get('reported_result','')} | "
-            f"{act.get('details','')[:80]}"
-        )
-    activities_text = "\n".join(act_lines) if act_lines else "None"
-
-    user_prompt = f"""=== CASE ===
-case_id: {case['case_id']}
-email: {case['email']}
-requested_at: {case['requested_at']}
-reported_status: {case['reported_status']}
-audit_at: {case['audit_at']}
-request_text: {case['request_text']}
-
-=== USER IDENTITY ===
-user_id: {user_id or 'NOT FOUND'}
-all known emails: {', '.join(all_emails)}
-
-=== EVIDENCE RECORDS (captured ≤ audit_at) ===
-{records_text}
-
-=== DELETION-RELATED SYSTEM ACTIVITY (between request and audit_at) ===
-{activities_text}
-
-Analyze this case and produce the JSON output."""
-
-    for attempt in range(3):
-        try:
-            resp = client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=2048,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-            usage_tracker.append({
-                "input_tokens": resp.usage.input_tokens,
-                "output_tokens": resp.usage.output_tokens
-            })
-            content = resp.content[0].text.strip()
-            content = re.sub(r"^```[a-z]*\n?", "", content)
-            content = re.sub(r"\n?```$", "", content)
-            result = json.loads(content)
-            return result
-        except json.JSONDecodeError as e:
-            log.warning("Case %s: JSON parse error attempt %d: %s",
-                        case["case_id"], attempt + 1, e)
-            if attempt == 2:
-                return {"deletion_status": "INCOMPLETE", "steps": []}
-        except Exception as e:
-            log.warning("Case %s: API error attempt %d: %s",
-                        case["case_id"], attempt + 1, e)
-            if attempt < 2:
-                time.sleep(5 * (attempt + 1))
+        state   = "PRESENT" if has_pii else "ANONYMIZED"
+        emails   = [email] if _is_email(email) else []
+        user_ids = [uid]   if _is_uid(uid) else []
+        if not (emails or user_ids or ehash): continue
+        idx.add(Record(fid, cat, "analytics_platform", rid, state,
+                       emails=emails, user_ids=user_ids), hashes=[ehash] if ehash else None)
+
+
+def parse_snapshot_bundle(fid, cat, data, idx):
+    """Parse customer_data_snapshot_bundle JSON."""
+    for snap in data.get("snapshots", []):
+        store = snap.get("data_store", "unknown")
+        for r in snap.get("records", []):
+            rid  = r.get("resource_id")
+            if not rid: continue
+            subj = r.get("subject_reference", "") or ""
+            emails   = [subj]      if _is_email(subj) else []
+            user_ids = [subj]      if _is_uid(subj) else []
+            # Also check direct email field
+            direct_email = r.get("email", "") or ""
+            if _is_email(direct_email) and direct_email not in emails:
+                emails.append(direct_email)
+            if not (emails or user_ids): continue
+            # State: for identity_service, check if PII fields are present
+            if store == "identity_service":
+                has_pii = any(r.get(k) for k in ["email","name","phone","email_hash"])
+                state   = "PRESENT" if has_pii else "REDACTED"
+            elif store == "security_service":
+                state = "PRESENT"  # always retain
+            elif r.get("account_status") == "DELETED":
+                state = "ABSENT"
             else:
-                return {"deletion_status": "INCOMPLETE", "steps": []}
-    return {"deletion_status": "INCOMPLETE", "steps": []}
+                has_pii = any(r.get(k) for k in ["email","name","phone","email_hash"])
+                state   = "PRESENT" if has_pii else "REDACTED"
+            idx.add(Record(fid, cat, store, rid, state, emails=emails, user_ids=user_ids, extra=r))
+
+
+def parse_sre_json(fid, cat, data, idx):
+    """Parse service_resource_export JSON."""
+    ex = data.get("service_exports", {})
+
+    for e in ex.get("account_service", {}).get("profile_lookups", []):
+        rid=e.get("resource_id"); p=e.get("profile") or {}
+        emails=[v for k,v in p.items() if k=="email" and v]
+        uids=[v for k,v in p.items() if k=="customer_reference" and v]
+        if rid: idx.add(Record(fid,cat,"account_service",rid,
+                               "ABSENT" if e.get("status_code")==404 else "PRESENT",
+                               emails=emails,user_ids=uids))
+
+    for e in ex.get("analytics_platform", {}).get("profiles", []):
+        rid=e.get("resource_id")
+        emails=[v for k,v in e.items() if k in ["email"] and v]
+        uids=[v for k,v in e.items() if k=="customer_reference" and v]
+        pii=any(e.get(k) for k in ["email","phone","email_hash"])
+        if rid and (emails or uids):
+            idx.add(Record(fid,cat,"analytics_platform",rid,"PRESENT" if pii else "ANONYMIZED",
+                           emails=emails,user_ids=uids))
+
+    for e in ex.get("backup_service", {}).get("restore_entries", []):
+        rid=e.get("resource_id")
+        emails=[v for k,v in e.items() if k=="customer_email" and v]
+        uids=[v for k,v in e.items() if k=="customer_reference" and v]
+        if rid and (emails or uids):
+            idx.add(Record(fid,cat,"backup_service",rid,
+                           "ACTIVE" if e.get("restore_allowed") else "BLOCKED",
+                           emails=emails,user_ids=uids))
+
+    for e in ex.get("export_service", {}).get("exports", []):
+        rid=e.get("resource_id")
+        emails=[v for k,v in e.items() if k=="owner_email" and v]
+        uids=[v for k,v in e.items() if k=="customer_reference" and v]
+        if rid and (emails or uids):
+            idx.add(Record(fid,cat,"export_service",rid,"PRESENT",emails=emails,user_ids=uids))
+
+    for e in ex.get("integration_service", {}).get("connectors", []):
+        rid=e.get("resource_id")
+        emails=[v for k,v in e.items() if k=="customer_email" and v]
+        uids=[v for k,v in e.items() if k=="customer_reference" and v]
+        if rid and (emails or uids):
+            idx.add(Record(fid,cat,"integration_service",rid,
+                           "ACTIVE" if e.get("enabled") else "DISABLED",
+                           emails=emails,user_ids=uids))
+
+    for e in ex.get("search_service", {}).get("index_queries", []):
+        rid=e.get("resource_id"); hits=e.get("hits",{})
+        docs=hits.get("documents",[])
+        emails=[d.get("email") for d in docs if d.get("email")]
+        uids=[d.get("customer_reference") for d in docs if d.get("customer_reference")]
+        if rid and (emails or uids):
+            idx.add(Record(fid,cat,"search_service",rid,
+                           "PRESENT" if hits.get("total",0)>0 else "ABSENT",
+                           emails=emails,user_ids=uids))
+
+    for e in ex.get("support_platform", {}).get("tickets", []):
+        rid=e.get("resource_id")
+        emails=[v for k,v in e.items() if k=="requester_email" and v]
+        uids=[v for k,v in e.items() if k=="customer_reference" and v]
+        pii=any(e.get(k) for k in ["requester_email","requester_name","requester_phone"])
+        if rid and (emails or uids):
+            idx.add(Record(fid,cat,"support_platform",rid,"PRESENT" if pii else "REDACTED",
+                           emails=emails,user_ids=uids))
+
+    for e in ex.get("identity_service", {}).get("tombstones", []):
+        rid=e.get("resource_id")
+        emails=[v for k,v in e.items() if k=="email" and v]
+        uids=[v for k,v in e.items() if k in ["user_id","customer_reference"] and v]
+        pii=any(e.get(k) for k in ["email","full_name","phone"])
+        if rid and (emails or uids):
+            idx.add(Record(fid,cat,"identity_service",rid,"PRESENT" if pii else "REDACTED",
+                           emails=emails,user_ids=uids))
+
+    for e in ex.get("marketing_platform", {}).get("profiles", []):
+        rid=e.get("resource_id")
+        emails=[v for k,v in e.items() if k in ["email","customer_email"] and v]
+        uids=[v for k,v in e.items() if k=="customer_reference" and v]
+        if rid and (emails or uids):
+            idx.add(Record(fid,cat,"marketing_platform",rid,"PRESENT",emails=emails,user_ids=uids))
+
+
+def parse_service_events_log(fid, cat, path, idx, hash_to_emails: Dict[str,str]):
+    """Parse service_events_*.log: groups lines by trace_id, extracts email+resource+state."""
+    VALID_SYSTEMS = {
+        "account_service","search_service","analytics_platform","support_platform",
+        "export_service","integration_service","backup_service","security_service",
+        "identity_service","marketing_platform","support_replica",
+    }
+    try:
+        pairs: Dict[str,Dict] = {}
+        # Also track resource→email from lines that have both
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            # Direct resource+email in same line (no trace_id needed)
+            rid_m = re.search(r"\bresource_id=([a-zA-Z_][a-zA-Z0-9_]*)", line)
+            srv_m = re.search(r"\bservice=([a-zA-Z_]+)", line)
+            if not rid_m or not srv_m: continue
+            rid    = rid_m.group(1)
+            sys_id = srv_m.group(1)
+            if sys_id not in VALID_SYSTEMS: continue
+
+            # Extract trace_id
+            tid_m = re.search(r"trace_id=([^\s]+)", line)
+            if tid_m:
+                tid = tid_m.group(1)
+                if tid not in pairs: pairs[tid] = {}
+                p = pairs[tid]
+                p["service"] = sys_id
+                p["resource_id"] = rid
+                # Emails from various keys
+                for k in ["lookup_key","subject_key","correlation_key","match_key"]:
+                    m = re.search(rf'\b{k}="?([^"\s]+)"?', line)
+                    if m:
+                        val = m.group(1)
+                        if _is_email(val):
+                            p.setdefault("emails",[])
+                            if val not in p["emails"]: p["emails"].append(val)
+                        elif val in hash_to_emails:
+                            p.setdefault("emails",[])
+                            e = hash_to_emails[val]
+                            if e not in p["emails"]: p["emails"].append(e)
+                        elif _is_uid(val):
+                            p.setdefault("user_ids",[])
+                            if val not in p["user_ids"]: p["user_ids"].append(val)
+                # State from event + attributes
+                ev_m = re.search(r"\bevent=([^\s]+)", line)
+                ev   = ev_m.group(1) if ev_m else ""
+                http = re.search(r"\bhttp_status=(\d+)", line)
+                rows = re.search(r"\brows=(\d+)", line)
+                enab = re.search(r"\benabled=(true|false)", line)
+                rest = re.search(r"\brestore_allowed=(true|false)", line)
+                dblk = re.search(r"\bdeletion_block=(true|false)", line)
+                elig = re.search(r"\beligible=(true|false)", line)
+                result_m = re.search(r"\bresult=(hit|miss)", line)
+                pii_m = re.search(r"\bmatched_value=", line)
+                mkr_m = re.search(r"\bmarker_found=(true|false)", line)
+
+                if http and http.group(1) == "404":
+                    p["state"] = "ABSENT"
+                elif rows and rows.group(1) == "0":
+                    p["state"] = "ABSENT"
+                elif rows and int(rows.group(1)) > 0:
+                    p["state"] = "PRESENT"
+                elif enab:
+                    p["state"] = "ACTIVE" if enab.group(1)=="true" else "DISABLED"
+                elif dblk:
+                    p["state"] = "BLOCKED" if dblk.group(1)=="true" else "ACTIVE"
+                elif elig and elig.group(1) == "true":
+                    p["state"] = "ACTIVE"  # backup can be restored
+                elif result_m and result_m.group(1) == "hit":
+                    p["state"] = "PRESENT"
+                elif pii_m:
+                    p["state"] = "PRESENT"  # PII found in scan
+                elif mkr_m:
+                    # deletion_marker_check: marker_found=false means NOT deleted
+                    p["state"] = "ABSENT" if mkr_m.group(1)=="true" else "PRESENT"
+
+        for p in pairs.values():
+            rid    = p.get("resource_id")
+            sys_id = p.get("service","")
+            emails = p.get("emails", [])
+            uids   = p.get("user_ids",[])
+            state  = p.get("state","PRESENT")
+            if not rid or not (emails or uids): continue
+            if sys_id == "support_replica": sys_id = "support_platform"
+            idx.add(Record(fid, cat, sys_id, rid, state, emails=emails, user_ids=uids))
+    except Exception as e:
+        log.warning("service_events log %s: %s", path.name, e)
+
+
+def parse_resource_lookup_log(fid, cat, path, idx):
+    """Parse resource_lookup_trace_*.log files."""
+    VALID = {"account_service","search_service","analytics_platform","support_platform",
+             "export_service","integration_service","backup_service","security_service",
+             "identity_service","marketing_platform"}
+    try:
+        pairs: Dict[str,Dict] = {}
+        for line in path.read_text(encoding="utf-8",errors="replace").splitlines():
+            if "event=" not in line and "service=" not in line: continue
+            tm = re.search(r"trace_id=(\S+)", line)
+            if not tm: continue
+            tid = tm.group(1)
+            if tid not in pairs: pairs[tid]={}
+            for k in ["service","resource_id","enabled","restore_allowed","customer_email",
+                       "customer_reference","lookup_key","requester_email","email",
+                       "http_status","rows","last_delivery_status","connector_name",
+                       "result","subject_reference"]:
+                m = re.search(rf"\b{k}=([^\s]+)", line)
+                if m: pairs[tid][k]=m.group(1)
+
+        for f in pairs.values():
+            rid=f.get("resource_id"); sys_id=f.get("service","")
+            if not rid or sys_id not in VALID: continue
+            emails=[f[k] for k in ["lookup_key","customer_email","email","requester_email"]
+                    if f.get(k) and "@" in f[k] and f[k]!="null"]
+            uids=[f[k] for k in ["customer_reference","subject_reference"]
+                  if f.get(k) and f[k]!="null" and _is_uid(f[k])]
+            if not emails and not uids: continue
+            h=f.get("http_status",""); rows=f.get("rows","")
+            en=f.get("enabled",""); ra=f.get("restore_allowed","")
+            if h=="404" or rows=="0":         state="ABSENT"
+            elif en=="false" or f.get("last_delivery_status")=="stopped": state="DISABLED"
+            elif ra=="false":                  state="BLOCKED"
+            elif en=="true" or ra=="true":     state="ACTIVE"
+            elif f.get("result")=="hit":       state="PRESENT"
+            elif sys_id=="analytics_platform": state="ANONYMIZED"
+            else:                              state="PRESENT"
+            idx.add(Record(fid,cat,sys_id,rid,state,emails=emails,user_ids=uids,extra=f))
+    except Exception as e: log.warning("lookup log %s: %s", path.name, e)
+
+
+def parse_handover_txt(fid, cat, path, idx):
+    STATUS_MAP = {"NOT_FOUND":"ABSENT","FOUND":"PRESENT","IDENTIFIABLE":"PRESENT",
+                  "ANONYMIZED":"ANONYMIZED","ACTIVE":"ACTIVE","DISABLED":"DISABLED",
+                  "BLOCKED":"BLOCKED","REDACTED":"REDACTED"}
+    try:
+        for line in path.read_text(encoding="utf-8",errors="replace").splitlines():
+            line=line.strip()
+            if not line.startswith("- "): continue
+            parts=[p.strip() for p in line[2:].split("|")]
+            if len(parts)<6: continue
+            _,sys_id,rid,_,status_raw,identifier=parts[:6]
+            state=STATUS_MAP.get(status_raw.upper(),"PRESENT")
+            emails=[identifier] if _is_email(identifier) else []
+            uids=[identifier] if _is_uid(identifier) else []
+            idx.add(Record(fid,cat,sys_id.strip(),rid.strip(),state,emails=emails,user_ids=uids))
+    except Exception as e: log.warning("handover %s: %s",path.name,e)
+
+
+def parse_sql(fid, cat, path, idx):
+    TABLE_SYS = {
+        "customer_profiles":"account_service","customer_search_documents":"search_service",
+        "customer_analytics_profiles":"analytics_platform","support_records":"support_platform",
+        "customer_exports":"export_service","connector_subscriptions":"integration_service",
+        "backup_restore_entries":"backup_service","security_audit_records":"security_service",
+    }
+    try:
+        sql=path.read_text(encoding="utf-8")
+        conn=sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.executescript(sql)
+        tables=[r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        for tbl in tables:
+            if tbl=="snapshot_scope": continue
+            sys_id=TABLE_SYS.get(tbl,"unknown")
+            try:
+                cols=[r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")]
+                rows=conn.execute(f"SELECT * FROM {tbl}").fetchall()
+            except: continue
+            for row in rows:
+                r=dict(zip(cols,row))
+                rid=r.get("resource_id")
+                if not rid: continue
+                rj={}
+                if r.get("record_json"):
+                    try: rj=json.loads(r["record_json"])
+                    except: pass
+                src={**r,**rj}
+                origin=src.get("origin_system",sys_id) or sys_id
+                emails=[v for k,v in src.items() if k in ["email","requester_email","owner_email","customer_email"] and v and _is_email(v)]
+                uids=[v for k,v in src.items() if k in ["customer_reference","user_id","subject_reference"] and v and _is_uid(v)]
+                if not (emails or uids): continue
+                ra=src.get("restore_allowed"); en=src.get("enabled")
+                if   ra in (0,"0",False):  state="BLOCKED"
+                elif ra in (1,"1",True):   state="ACTIVE"
+                elif en in (0,"0",False):  state="DISABLED"
+                elif en in (1,"1",True):   state="ACTIVE"
+                elif src.get("account_status")=="DELETED": state="ABSENT"
+                elif tbl=="security_audit_records": state="PRESENT"
+                else:
+                    pii=any(src.get(k) for k in ["email","phone","email_hash"])
+                    state="PRESENT" if pii or origin=="account_service" else ("ANONYMIZED" if origin=="analytics_platform" else "PRESENT")
+                idx.add(Record(fid,cat,origin,rid,state,emails=emails,user_ids=uids))
+        conn.close()
+    except Exception as e: log.warning("SQL %s: %s",path.name,e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build Index
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_index(evidence_csv, hash_to_emails: Dict[str,str]):
+    idx = EvidenceIndex()
+    for row in load_csv(evidence_csv):
+        fid=row["file_id"]; cat=parse_dt(row["captured_at"])
+        path=DATASET_DIR/row["file_path"]
+        if not path.exists(): continue
+        fname=path.name.lower(); suf=path.suffix.lower()
+        try:
+            if suf==".txt":
+                parse_handover_txt(fid,cat,path,idx)
+            elif suf==".json":
+                data=_jload(path)
+                if data is None: continue
+                if "service_exports" in data:
+                    parse_sre_json(fid,cat,data,idx)
+                elif "snapshots" in data:
+                    parse_snapshot_bundle(fid,cat,data,idx)
+                elif "collection" in data and "records" in data:
+                    col=data.get("collection","")
+                    if "export_job" in col or "export" in fname:
+                        parse_export_jobs_records(fid,cat,data,idx)
+                    elif "analytics" in col or "analytics" in fname:
+                        parse_analytics_records(fid,cat,data,idx)
+                    else:
+                        parse_generic_records(fid,cat,data,idx)
+                elif "records" in data:
+                    # Generic records format
+                    records=data["records"]
+                    if records and "system" in records[0]:
+                        parse_generic_records(fid,cat,data,idx)
+                    elif records and "owner_email" in records[0]:
+                        parse_export_jobs_records(fid,cat,data,idx)
+                    elif records and "user_id" in records[0]:
+                        parse_analytics_records(fid,cat,data,idx)
+                    else:
+                        parse_generic_records(fid,cat,data,idx)
+                else:
+                    # Fallback: scan for resource_id + email
+                    parse_generic_records(fid,cat,data,idx)
+            elif suf==".sql":
+                parse_sql(fid,cat,path,idx)
+            elif suf==".log":
+                if "resource_lookup_trace" in fname:
+                    parse_resource_lookup_log(fid,cat,path,idx)
+                else:
+                    parse_service_events_log(fid,cat,path,idx,hash_to_emails)
+        except Exception as e: log.warning("index %s: %s",fid,e)
+    log.info("Index: %d email keys, %d uid keys, %d hash keys",
+             len(idx._email), len(idx._uid), len(idx._hash))
+    return idx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Identity
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_identity(identities, audit_log):
+    e2u: Dict[str,Dict] = {}
+    u2e: Dict[str,List[str]] = defaultdict(list)
+    h2e: Dict[str,str] = {}  # email_hash → email
+
+    for u in identities:
+        e=norm(u.get("email","")); uid=u.get("user_id","")
+        ehash=u.get("email_hash","")
+        if e: e2u[e]=u
+        if uid and e and e not in u2e[uid]: u2e[uid].append(e)
+        if ehash and e: h2e[ehash]=e
+
+    for entry in audit_log:
+        uid=entry.get("user_id","")
+        field=entry.get("field_name","")
+        if field=="email":
+            for val in [entry.get("old_value",""),entry.get("new_value","")]:
+                e=norm(val)
+                if not e: continue
+                if e not in u2e[uid]: u2e[uid].append(e)
+                if e not in e2u:
+                    for ce in u2e[uid]:
+                        if ce in e2u: e2u[e]=e2u[ce]; break
+        elif field=="email_hash":
+            for val in [entry.get("old_value",""),entry.get("new_value","")]:
+                if val and val not in h2e:
+                    # Try to find email for this uid
+                    for ce in u2e[uid]:
+                        h2e[val]=ce; break
+
+    return e2u, u2e, h2e
+
+
+def resolve(email, e2u, u2e):
+    n=norm(email); u=e2u.get(n)
+    if u:
+        uid=u.get("user_id","")
+        return uid, list(set(u2e.get(uid,[n])+[n]))
+    for uid,emails in u2e.items():
+        if n in [norm(e) for e in emails]:
+            return uid, list(set(emails+[n]))
+    return None, [n]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deletion classifier
+# ─────────────────────────────────────────────────────────────────────────────
+
+DELETION_VERBS = re.compile(
+    r"\b(delete|delet\w+|erase\w*|erasure|remov\w+|clos\w+|wipe\w*|purge\w*|"
+    r"löschen|supprim\w*|effacer|borrar|eliminar|cleared?|cleaned?|"
+    r"gone|forgotten|handle\s+them|left\s+behind|no\s+longer|switch\s+off|"
+    r"keep\s+only|tombstone|inspect\s+the\s+actual|confirm\s+\w+\s+gone)\b",
+    re.IGNORECASE
+)
+DELETION_NOUNS = re.compile(
+    r"\b(account|profile|record|data|detail|personal|identifier|information|"
+    r"gdpr|right\s+to\s+be\s+forgotten|suppression|integration|backup|"
+    r"analytics|search\s+result|support|export|traces?)\b",
+    re.IGNORECASE
+)
+EXPLICIT_DELETION = re.compile(
+    r"\b(deletion|erasure|right\s+to\s+be\s+forgotten|gdpr|"
+    r"permanently\s+(?:remov|delet|clos)|account\s+was\s+delet\w+|"
+    r"verif\w+\s+\w+\s+delet\w+)\b",
+    re.IGNORECASE
+)
+
+FOREIGN_DELETION = re.compile(
+    r"\b(supprimer|suppression|effacement|supprimir|eliminaci[oó]n|eliminar|borrar|"
+    r"cuenta|compte|konto|l[oö]schen|widerruf|verwijder|verwijdering|"
+    r"cancella|cancellazione|usunięcie|usuń|удалить|削除|삭제|حذف)\b",
+    re.IGNORECASE
+)
+
+def is_deletion(text: str) -> bool:
+    if not text or not text.strip(): return False
+    ascii_ratio = sum(1 for c in text if ord(c) < 128) / max(len(text),1)
+    if ascii_ratio < 0.6: return True  # mostly non-ASCII → foreign language deletion
+    if EXPLICIT_DELETION.search(text): return True
+    if FOREIGN_DELETION.search(text): return True
+    return bool(DELETION_VERBS.search(text) and DELETION_NOUNS.search(text))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step generator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_steps(records: List[Record]) -> Tuple[str, List]:
+    if not records:
+        return "COMPLETE", []
+
+    # Keep most recent record per (sys_id, resource_id)
+    best: Dict[Tuple[str,str],Record] = {}
+    for rec in records:
+        key=(rec.system_id,rec.resource_id)
+        old=best.get(key)
+        if old is None: best[key]=rec
+        elif rec.captured_at and old.captured_at and rec.captured_at>old.captured_at: best[key]=rec
+        elif rec.captured_at and not old.captured_at: best[key]=rec
+
+    findings, remediations, verifications = [], [], []
+    incomplete = False
+
+    for (sys_id,rid),rec in sorted(best.items(), key=lambda x:(sys_rank(x[0][0]),x[0][1])):
+        state=rec.state; ev=rec.file_id
+        action=REQUIRED_ACTION.get(SYSTEM_CATEGORY.get(sys_id,""),"DELETE")
+
+        if sys_id=="security_service":
+            verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_PRESENT","state":"PRESENT","evidence_id":ev})
+
+        elif sys_id=="backup_service":
+            if state=="ACTIVE":
+                incomplete=True
+                findings.append({"phase":"FINDING","system_id":sys_id,"resource_id":rid,"operation":"REPORT_RESTORE_RISK","state":"ACTIVE","evidence_id":ev})
+                remediations.append({"phase":"REMEDIATION","system_id":sys_id,"resource_id":rid,"operation":"BLOCK_RESTORE","state":"BLOCKED","evidence_id":""})
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RESTORE_BLOCKED","state":"BLOCKED","evidence_id":""})
+            elif state=="BLOCKED":
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RESTORE_BLOCKED","state":"BLOCKED","evidence_id":ev})
+
+        elif sys_id=="integration_service":
+            if state=="ACTIVE":
+                incomplete=True
+                findings.append({"phase":"FINDING","system_id":sys_id,"resource_id":rid,"operation":"REPORT_ACTIVE_DATA_FLOW","state":"ACTIVE","evidence_id":ev})
+                remediations.append({"phase":"REMEDIATION","system_id":sys_id,"resource_id":rid,"operation":"DISABLE_DATA_FLOW","state":"DISABLED","evidence_id":""})
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_DATA_FLOW_DISABLED","state":"DISABLED","evidence_id":""})
+            elif state=="DISABLED":
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_DATA_FLOW_DISABLED","state":"DISABLED","evidence_id":ev})
+
+        elif action=="DELETE":
+            if state=="ABSENT":
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_ABSENT","state":"ABSENT","evidence_id":ev})
+            elif state in ("PRESENT","IDENTIFIABLE","FOUND"):
+                incomplete=True
+                findings.append({"phase":"FINDING","system_id":sys_id,"resource_id":rid,"operation":"REPORT_REMAINING_RECORD","state":"PRESENT","evidence_id":ev})
+                remediations.append({"phase":"REMEDIATION","system_id":sys_id,"resource_id":rid,"operation":"DELETE_RECORD","state":"ABSENT","evidence_id":""})
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_ABSENT","state":"ABSENT","evidence_id":""})
+
+        elif action=="ANONYMIZE":
+            if state=="ANONYMIZED":
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_ANONYMIZED","state":"ANONYMIZED","evidence_id":ev})
+            elif state in ("PRESENT","IDENTIFIABLE"):
+                incomplete=True
+                findings.append({"phase":"FINDING","system_id":sys_id,"resource_id":rid,"operation":"REPORT_EXPOSED_PII","state":"PRESENT","evidence_id":ev})
+                remediations.append({"phase":"REMEDIATION","system_id":sys_id,"resource_id":rid,"operation":"ANONYMIZE_RECORD","state":"ANONYMIZED","evidence_id":""})
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_ANONYMIZED","state":"ANONYMIZED","evidence_id":""})
+
+        elif action=="REDACT":
+            if state=="REDACTED":
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_REDACTED","state":"REDACTED","evidence_id":ev})
+            elif state in ("PRESENT","IDENTIFIABLE"):
+                incomplete=True
+                findings.append({"phase":"FINDING","system_id":sys_id,"resource_id":rid,"operation":"REPORT_EXPOSED_PII","state":"PRESENT","evidence_id":ev})
+                remediations.append({"phase":"REMEDIATION","system_id":sys_id,"resource_id":rid,"operation":"REDACT_RECORD","state":"REDACTED","evidence_id":""})
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_REDACTED","state":"REDACTED","evidence_id":""})
+            elif state=="ABSENT":
+                verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_ABSENT","state":"ABSENT","evidence_id":ev})
+
+    def skey(step, phase):
+        return (OP_ORDER.get(phase,{}).get(step["operation"],99), sys_rank(step["system_id"]), step["resource_id"])
+
+    findings.sort(     key=lambda s: skey(s,"FINDING"))
+    remediations.sort( key=lambda s: skey(s,"REMEDIATION"))
+    verifications.sort(key=lambda s: skey(s,"VERIFICATION"))
+
+    if incomplete:
+        all_steps = findings + remediations + verifications
+        status = "INCOMPLETE"
+    else:
+        all_steps = verifications
+        status = "COMPLETE"
+
+    for i,s in enumerate(all_steps,1): s["step_no"]=i
+    ordered=[{"step_no":s["step_no"],"phase":s["phase"],"system_id":s["system_id"],
+               "resource_id":s["resource_id"],"operation":s["operation"],
+               "state":s["state"],"evidence_id":s["evidence_id"]} for s in all_steps]
+    return status, ordered
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1037,137 +748,36 @@ Analyze this case and produce the JSON output."""
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    from anthropic import Anthropic
+    log.info("Loading dataset...")
+    requests   = load_csv(DATASET_DIR/"deletion_requests.csv")
+    identities = load_csv(DATASET_DIR/"user_identities.csv")
+    audit_log  = load_csv(DATASET_DIR/"user_audit_log.csv")
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        env_path = REPO_ROOT / ".env"
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                if line.startswith("ANTHROPIC_API_KEY="):
-                    api_key = line.split("=", 1)[1].strip().strip('"\'')
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY not set. Set it as env var or in .env file.")
-        sys.exit(1)
+    e2u, u2e, h2e = build_identity(identities, audit_log)
+    idx = build_index(DATASET_DIR/"evidence_files.csv", h2e)
 
-    client = Anthropic(api_key=api_key)
+    results=[]; na=comp=inc=0
+    for i,case in enumerate(requests):
+        case_id=case["case_id"]
+        if not is_deletion(case.get("request_text","")):
+            results.append({"case_id":case_id,"deletion_status":"NOT_APPLICABLE","steps_json":"[]"}); na+=1; continue
+        audit_at=parse_dt(case.get("audit_at",""))
+        uid,emails=resolve(case.get("email",""),e2u,u2e)
+        uids=[uid] if uid else []
+        u_hashes=[k for k,v in h2e.items() if v in [norm(e) for e in emails]]
+        records=idx.find(emails,uids,audit_at,hashes=u_hashes)
+        status,steps=generate_steps(records)
+        if status=="COMPLETE": comp+=1
+        else: inc+=1
+        if (i+1)%50==0: log.info("[%d/%d] COMPLETE=%d INCOMPLETE=%d N/A=%d",i+1,len(requests),comp,inc,na)
+        results.append({"case_id":case_id,"deletion_status":status,"steps_json":json.dumps(steps,separators=(",",":"))})
 
-    log.info("Loading dataset files...")
-    deletion_requests = load_csv_rows(DATASET_DIR / "deletion_requests.csv")
-    user_identities = load_csv_rows(DATASET_DIR / "user_identities.csv")
-    user_audit_log = load_csv_rows(DATASET_DIR / "user_audit_log.csv")
-    activities = load_system_activity(DATASET_DIR / "system_activity.csv")
-
-    log.info("Building identity maps...")
-    email_to_user, user_id_to_emails = build_identity_maps(user_identities, user_audit_log)
-
-    log.info("Building evidence index...")
-    index = build_evidence_index(DATASET_DIR / "evidence_files.csv")
-
-    usage_tracker: List[Dict] = []
-    results = []
-    total = len(deletion_requests)
-
-    log.info("Processing %d deletion requests...", total)
-    for i, case in enumerate(deletion_requests):
-        case_id = case["case_id"]
-        log.info("[%d/%d] %s (%s)", i + 1, total, case_id, case.get("email", ""))
-
-        is_deletion = is_deletion_request(case.get("request_text", ""))
-        if not is_deletion:
-            results.append({"case_id": case_id, "deletion_status": "NOT_APPLICABLE", "steps_json": "[]"})
-            continue
-
-        user_id, all_emails = resolve_identity(case.get("email", ""), email_to_user, user_id_to_emails)
-        user_ids = [user_id] if user_id else []
-        audit_at = parse_dt(case.get("audit_at", ""))
-        requested_at = parse_dt(case.get("requested_at", ""))
-
-        # Find evidence records
-        records = index.find(all_emails, user_ids, audit_at)
-
-        # Find known resource_ids from evidence
-        known_rids = {r.resource_id for r in records}
-
-        # Find relevant activities
-        deletion_acts = get_deletion_activities(activities, requested_at, audit_at)
-        relevant_acts = filter_activity_for_case(activities, known_rids, requested_at, audit_at)
-        # Combine, dedup
-        all_act_ids = {a["activity_id"] for a in deletion_acts}
-        for a in relevant_acts:
-            if a["activity_id"] not in all_act_ids:
-                deletion_acts.append(a)
-                all_act_ids.add(a["activity_id"])
-
-        result = call_claude(client, case, user_id, all_emails, records,
-                             is_deletion, deletion_acts[:40], usage_tracker)
-
-        deletion_status = result.get("deletion_status", "INCOMPLETE")
-        steps = result.get("steps", [])
-        for j, step in enumerate(steps):
-            step["step_no"] = j + 1
-
-        results.append({
-            "case_id": case_id,
-            "deletion_status": deletion_status,
-            "steps_json": json.dumps(steps, separators=(",", ":"))
-        })
-
-        # Small rate limit pause
-        if (i + 1) % 10 == 0:
-            time.sleep(1)
-
-    # Sort by case_id number
-    results.sort(key=lambda r: int(re.search(r"\d+", r["case_id"]).group()) if re.search(r"\d+", r["case_id"]) else 0)
-
-    log.info("Writing %s...", OUTPUT_FILE)
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["case_id", "deletion_status", "steps_json"])
-        writer.writeheader()
-        writer.writerows(results)
-
-    # Usage summary
-    if usage_tracker:
-        total_in = sum(u["input_tokens"] for u in usage_tracker)
-        total_out = sum(u["output_tokens"] for u in usage_tracker)
-        n_calls = len(usage_tracker)
-        log.info("API usage: %d calls, %d input tokens, %d output tokens",
-                 n_calls, total_in, total_out)
-        log.info("Avg per case: %.0f input, %.0f output tokens",
-                 total_in / n_calls, total_out / n_calls)
-        # Estimate cost: claude-opus-4-5 pricing (approximate)
-        cost_in = total_in / 1_000_000 * 15.0
-        cost_out = total_out / 1_000_000 * 75.0
-        log.info("Estimated cost: $%.2f (input) + $%.2f (output) = $%.2f",
-                 cost_in, cost_out, cost_in + cost_out)
-
-        # Write usage report
-        usage_report = REPO_ROOT / "code" / "evaluation" / "usage_report.md"
-        usage_report.parent.mkdir(exist_ok=True)
-        with open(usage_report, "w") as f:
-            f.write(f"""# Usage Report — Ghost Data Still Exists
-
-## Final Full-Dataset Run
-
-- **Model provider:** Anthropic
-- **Model name:** claude-opus-4-5
-- **Total model calls:** {n_calls}
-- **Total input tokens:** {total_in:,}
-- **Total output tokens:** {total_out:,}
-- **Average input tokens per request:** {total_in // n_calls:,}
-- **Average output tokens per request:** {total_out // n_calls:,}
-- **Estimated total cost:** ${cost_in + cost_out:.2f}
-- **Estimated cost per request:** ${(cost_in + cost_out) / n_calls:.4f}
-
-## Notes
-
-Single model (claude-opus-4-5) used for all cases.
-Evidence indexing was done programmatically (no API tokens consumed).
-""")
-        log.info("Usage report written to %s", usage_report)
-
-    log.info("Done. %d rows written.", len(results))
+    results.sort(key=lambda r:int(re.search(r"\d+",r["case_id"]).group()))
+    with open(OUTPUT_FILE,"w",newline="",encoding="utf-8") as f:
+        w=csv.DictWriter(f,fieldnames=["case_id","deletion_status","steps_json"])
+        w.writeheader(); w.writerows(results)
+    log.info("Done. %d rows: COMPLETE=%d INCOMPLETE=%d NOT_APPLICABLE=%d",len(results),comp,inc,na)
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
