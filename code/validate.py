@@ -51,7 +51,7 @@ def main():
         step_precision = len(matched)/len(got_set) if got_set else (1.0 if not exp_set else 0.0)
         step_recall    = len(matched)/len(exp_set) if exp_set else (1.0 if not got_set else 0.0)
 
-        mark = "✓" if status_ok else "✗"
+        mark = "OK" if status_ok else "FAIL"
         if not status_ok or step_recall < 1.0:
             step_details.append((cid, exp_status, got_status, status_ok, step_recall, step_precision,
                                   exp_set - got_set, got_set - exp_set))
