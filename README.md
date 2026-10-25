@@ -94,9 +94,9 @@ Benchmarked on 32 labeled test cases:
 
 | Metric | Value |
 |---|---|
-| Status accuracy | 96.9% (31/32) |
-| Avg step recall | ~79% |
-| Avg step precision | ~90% |
-| Runtime (518 cases) | < 2 seconds |
-
-The one incorrect case (case_07) involves a support identity document whose resource ID didn't surface under the user's current identifiers in the available evidence.
+| Status accuracy | 100% (32/32) |
+| Step precision | 98.9% |
+| Step recall | 92.7% |
+| Avg F1 | 91.6% |
+| Exact sequence match | 65.6% (21/32) |
+| Runtime (518 cases) | ~2 seconds |

@@ -57,8 +57,43 @@ def main():
                                   exp_set - got_set, got_set - exp_set))
         print(f"{mark} {cid}: expected={exp_status:12s} got={got_status:12s} | steps recall={step_recall:.0%} precision={step_precision:.0%}")
 
+    # Aggregate step metrics
+    all_exp, all_got, all_matched = 0, 0, 0
+    f1_sum = 0.0
+    for cid in sorted(sample_ids):
+        exp = sample[cid]; got = ours[cid]
+        try: es = json.loads(exp["steps_json"])
+        except: es = []
+        try: gs = json.loads(got["steps_json"])
+        except: gs = []
+        exp_set = {(s["phase"],s["system_id"],s["resource_id"],s["operation"],s["state"]) for s in es}
+        got_set = {(s["phase"],s["system_id"],s["resource_id"],s["operation"],s["state"]) for s in gs}
+        matched = exp_set & got_set
+        all_exp += len(exp_set); all_got += len(got_set); all_matched += len(matched)
+        p = len(matched)/len(got_set) if got_set else (1.0 if not exp_set else 0.0)
+        r = len(matched)/len(exp_set) if exp_set else (1.0 if not got_set else 0.0)
+        f1_sum += (2*p*r/(p+r)) if (p+r) > 0 else 0.0
+
+    macro_p = all_matched/all_got if all_got else 1.0
+    macro_r = all_matched/all_exp if all_exp else 1.0
+    avg_f1  = f1_sum / total
+
+    # Exact sequence matching
+    exact_seq = 0
+    for cid in sorted(sample_ids):
+        exp = sample[cid]; got = ours[cid]
+        try: es = json.loads(exp["steps_json"])
+        except: es = []
+        try: gs = json.loads(got["steps_json"])
+        except: gs = []
+        def norm(steps):
+            return [(s["phase"],s["system_id"],s["resource_id"],s["operation"],s["state"]) for s in steps]
+        if norm(es) == norm(gs): exact_seq += 1
+
     print()
     print(f"=== STATUS ACCURACY: {status_correct}/{total} = {status_correct/total:.1%} ===")
+    print(f"=== Exact sequence: {exact_seq}/{total} = {exact_seq/total:.1%} ===")
+    print(f"=== Step precision: {macro_p:.1%}  recall: {macro_r:.1%}  avg-F1: {avg_f1:.1%} ===")
 
     if step_details:
         print("\n--- MISMATCHES / MISSING STEPS ---")

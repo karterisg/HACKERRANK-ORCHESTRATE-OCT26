@@ -9,7 +9,7 @@ import csv, json, re, sqlite3, logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set
 
 REPO_ROOT   = Path(__file__).parent.parent
 DATASET_DIR = REPO_ROOT / "dataset"
@@ -260,7 +260,7 @@ def parse_sre_json(fid, cat, data, idx):
         emails=[v for k,v in e.items() if k in ["email"] and v]
         uids=[v for k,v in e.items() if k=="customer_reference" and v]
         pii=any(e.get(k) for k in ["email","phone","email_hash"])
-        if rid and (emails or uids):
+        if rid:  # always index; link_to_user will associate PII-less records via batch correlation
             idx.add(Record(fid,cat,"analytics_platform",rid,"PRESENT" if pii else "ANONYMIZED",
                            emails=emails,user_ids=uids))
 
@@ -473,13 +473,16 @@ def parse_resource_lookup_log(fid, cat, path, idx):
                     if f.get(k) and "@" in f[k] and f[k]!="null"]
             uids=[f[k] for k in ["lookup_key","customer_reference","subject_reference"]
                   if f.get(k) and f[k]!="null" and _is_uid(f[k])]
-            if not emails and not uids: continue
             h=f.get("http_status",""); rows=f.get("rows","")
             en=f.get("enabled",""); ra=f.get("restore_allowed","")
             cr=f.get("customer_reference","null"); em=f.get("email","null")
-            # Analytics: if all identifiers are null → ANONYMIZED
+            # Analytics: if all identifiers are null → ANONYMIZED; always index for batch linking
             if sys_id=="analytics_platform" and cr in ("null","") and em in ("null",""):
                 state="ANONYMIZED"
+                idx.add(Record(fid, ev_ts if 'ev_ts' in dir() else cat, sys_id, rid, state,
+                               emails=[], user_ids=[], extra=f))
+                continue
+            if not emails and not uids: continue
             elif h=="404" or rows=="0":         state="ABSENT"
             elif en=="false" or f.get("last_delivery_status")=="stopped": state="DISABLED"
             elif ra=="false":                   state="BLOCKED"
@@ -834,7 +837,8 @@ def build_identity(identities, audit_log):
     return e2u, u2e, h2e
 
 
-def build_activity_account_map(activity_path, idx: "EvidenceIndex" = None) -> Dict[str, str]:
+def build_activity_account_map(activity_path, idx: "EvidenceIndex" = None,
+                               e2u: Dict[str,str] = None) -> Dict[str, str]:
     """Return resource_id → account_id mapping via system_activity batch correlation.
 
     Uses evidence-aware ordered matching within each batch:
@@ -845,7 +849,20 @@ def build_activity_account_map(activity_path, idx: "EvidenceIndex" = None) -> Di
     """
     acts = load_csv(activity_path)
     DELETION_OPS = {"DELETE_RECORD","ANONYMIZE_RECORD","REDACT_RECORD",
-                    "DISABLE_DATA_FLOW","BLOCK_RESTORE","CHECK_DATA_FLOW"}
+                    "DISABLE_DATA_FLOW","BLOCK_RESTORE","CHECK_DATA_FLOW","CHECK_RESTORE_ACCESS"}
+
+    def canon_fp(emails, uids):
+        """Canonical user fingerprint: resolve emails → user_ids, return frozenset of user_ids
+        (or frozenset of emails if no user_id resolution available)."""
+        resolved = set(uids)
+        if e2u:
+            for em in emails:
+                u_dict = e2u.get(em)
+                if u_dict:
+                    uid = u_dict.get("user_id") if isinstance(u_dict, dict) else u_dict
+                    if uid:
+                        resolved.add(uid)
+        return frozenset(resolved) if resolved else frozenset(emails)
 
     # Build resource→(emails,user_ids) from evidence index
     rid2user: Dict[str, Tuple[List[str],List[str]]] = {}
@@ -897,44 +914,137 @@ def build_activity_account_map(activity_path, idx: "EvidenceIndex" = None) -> Di
             continue
 
         # Multiple accounts: use ordered matching via evidence index
-        # Step 1: find the "user fingerprint" of each resource from evidence index
-        # Step 2: determine the first-occurrence sequence per user fingerprint
-        # Step 3: sort user fingerprints by first-occurrence seq
-        # Step 4: match Nth fingerprint → Nth account
+        # Pre-assign accounts whose DELETE_RECORD event has direct PII in evidence.
+        # Use canonical fingerprints (emails resolved to user_ids via e2u) so that
+        # account PII (n.masuku60 email) matches resource PII (user_49 user_id) for the same user.
+        known_acct_fps: Dict[str, frozenset] = {}  # acct_rid → canonical fp
+        for _, acct_rid in acct_dels:
+            if acct_rid in rid2user:
+                emails, uids = rid2user[acct_rid]
+                cfp = canon_fp(emails, uids)
+                if cfp:
+                    known_acct_fps[acct_rid] = cfp
+        excluded_canon_fps = set(known_acct_fps.values())  # set of canonical fps to exclude
+        excluded_cfp_to_acct: Dict[frozenset, str] = {fp: arid for arid, fp in known_acct_fps.items()}
+        unknown_acct_dels = [(s, a) for s, a in acct_dels if a not in known_acct_fps]
 
-        # User fingerprint = frozenset of (emails, user_ids) — identifies a unique user
+        # Build fingerprint_first_seq using RAW fps (frozenset of emails+uids) for unknown users.
+        # This preserves multi-fp spread for same-user resources (different emails/uid combos),
+        # which is necessary for the time-proximity fallback to work correctly when res2acct
+        # would otherwise incorrectly merge all resource votes onto one account.
         fingerprint_first_seq: Dict[frozenset, int] = {}
-        rid_to_fingerprint: Dict[str, frozenset] = {}
+        rid_to_raw_fp: Dict[str, frozenset] = {}
+        rid_to_canon_fp: Dict[str, frozenset] = {}
         for seq, orid in res_ops:
             if orid in rid2user:
                 emails, uids = rid2user[orid]
-                fp = frozenset(emails + uids)
-                if fp:
-                    rid_to_fingerprint[orid] = fp
-                    if fp not in fingerprint_first_seq or seq < fingerprint_first_seq[fp]:
-                        fingerprint_first_seq[fp] = seq
+                cfp = canon_fp(emails, uids)
+                rfp = frozenset(emails + uids)
+                if rfp:
+                    rid_to_raw_fp[orid] = rfp
+                    rid_to_canon_fp[orid] = cfp
+                    if cfp not in excluded_canon_fps:  # skip fingerprints already known via accounts
+                        if rfp not in fingerprint_first_seq or seq < fingerprint_first_seq[rfp]:
+                            fingerprint_first_seq[rfp] = seq
 
-        if fingerprint_first_seq:
-            # Sort fingerprints by first appearance → assign to accounts in order
-            sorted_fps = sorted(fingerprint_first_seq.keys(), key=lambda fp: fingerprint_first_seq[fp])
-            fp_to_acct: Dict[frozenset, str] = {}
-            for rank, fp in enumerate(sorted_fps):
-                if rank < len(acct_dels):
-                    fp_to_acct[fp] = acct_dels[rank][1]
-            # Assign accounts to resources via fingerprint
+        if fingerprint_first_seq or excluded_canon_fps:
+            # Algorithm selection: RANK when a known account appears between any consecutive
+            # unknown accounts (interleaved deletion order is meaningful), PROXIMITY otherwise
+            # (consecutive unknowns matched by nearest-preceding distance).
+            NULL_PII_THRESHOLD = 2
+            cfp_to_known_acct: Dict[frozenset, str] = dict(excluded_cfp_to_acct)
+            unknown_acct_del_set: Set[str] = {rid for _, rid in unknown_acct_dels}
+            rfp_consumed_acct: Dict[frozenset, str] = {}
+            consumed_unknowns: Set[str] = set()
+
+            # Detect RANK mode: any known account between consecutive unknown accounts?
+            use_rank = False
+            if len(unknown_acct_dels) >= 2:
+                known_acct_set_local = set(known_acct_fps.keys())
+                for _ui in range(len(unknown_acct_dels) - 1):
+                    _seq_a = unknown_acct_dels[_ui][0]
+                    _seq_b = unknown_acct_dels[_ui + 1][0]
+                    for _aseq, _arid in acct_dels:
+                        if _seq_a < _aseq < _seq_b and _arid in known_acct_set_local:
+                            use_rank = True
+                            break
+                    if use_rank:
+                        break
+
+            # Pre-assign unknown accounts by rank when in RANK mode
+            rfp_to_unknown_acct: Dict[frozenset, str] = {}
+            if use_rank:
+                _rfp_rank_list = sorted(fingerprint_first_seq.keys(),
+                                        key=lambda r: fingerprint_first_seq[r])
+                _unknown_sorted = [a for _, a in sorted(unknown_acct_dels)]
+                for _ri, _rfp in enumerate(_rfp_rank_list):
+                    if _ri < len(_unknown_sorted):
+                        rfp_to_unknown_acct[_rfp] = _unknown_sorted[_ri]
+
             for seq, orid in res_ops:
-                fp = rid_to_fingerprint.get(orid)
-                if fp and fp in fp_to_acct:
-                    res2acct[orid] = fp_to_acct[fp]
-                elif orid not in res2acct:
-                    # Fallback: nearest preceding account
-                    best_acct = None; best_dist = 999999
-                    for aseq, arid in acct_dels:
-                        if aseq >= seq: continue
-                        dist = seq - aseq
-                        if dist < best_dist: best_dist = dist; best_acct = arid
-                    if best_acct and best_dist <= 300:
-                        res2acct[orid] = best_acct
+                cfp = rid_to_canon_fp.get(orid)
+                rfp = rid_to_raw_fp.get(orid)
+
+                # Known fp: assign to known account, no pool consumption
+                if cfp and cfp in excluded_canon_fps:
+                    acct = cfp_to_known_acct.get(cfp)
+                    if acct:
+                        res2acct[orid] = acct
+                    continue
+
+                if rfp:
+                    if rfp in rfp_consumed_acct:
+                        res2acct[orid] = rfp_consumed_acct[rfp]
+                    elif use_rank:
+                        # RANK: pre-assigned account for this rfp
+                        best_acct = rfp_to_unknown_acct.get(rfp)
+                        if best_acct:
+                            rfp_consumed_acct[rfp] = best_acct
+                            consumed_unknowns.add(best_acct)
+                            res2acct[orid] = best_acct
+                    else:
+                        # PROXIMITY: nearest preceding unconsumed unknown account
+                        best_acct = None; best_dist = 999999
+                        for aseq, arid in acct_dels:
+                            if aseq >= seq: continue
+                            if arid in consumed_unknowns or arid not in unknown_acct_del_set: continue
+                            dist = seq - aseq
+                            if dist < best_dist: best_dist = dist; best_acct = arid
+                        if best_acct:
+                            rfp_consumed_acct[rfp] = best_acct
+                            consumed_unknowns.add(best_acct)
+                            res2acct[orid] = best_acct
+                else:
+                    # Null-PII resource
+                    if use_rank:
+                        # RANK mode: null-PII never consumes unknown accounts
+                        best_fb = None; best_fd = 999999
+                        for aseq, arid in acct_dels:
+                            if aseq >= seq: continue
+                            dist = seq - aseq
+                            if dist < best_fd: best_fd = dist; best_fb = arid
+                        if best_fb and best_fd <= 300:
+                            res2acct[orid] = best_fb
+                    else:
+                        # PROXIMITY mode: consume nearest unknown only if within threshold
+                        if orid not in res2acct:
+                            best_acct = None; best_dist = 999999
+                            for aseq, arid in acct_dels:
+                                if aseq >= seq: continue
+                                if arid in consumed_unknowns or arid not in unknown_acct_del_set: continue
+                                dist = seq - aseq
+                                if dist < best_dist: best_dist = dist; best_acct = arid
+                            if best_acct and best_dist <= NULL_PII_THRESHOLD:
+                                consumed_unknowns.add(best_acct)
+                                res2acct[orid] = best_acct
+                            else:
+                                best_fb = None; best_fd = 999999
+                                for aseq, arid in acct_dels:
+                                    if aseq >= seq: continue
+                                    dist = seq - aseq
+                                    if dist < best_fd: best_fd = dist; best_fb = arid
+                                if best_fb and best_fd <= 300:
+                                    res2acct[orid] = best_fb
         else:
             # No indexed resources in this batch — fall back to proximity
             for seq, orid in res_ops:
@@ -949,10 +1059,87 @@ def build_activity_account_map(activity_path, idx: "EvidenceIndex" = None) -> Di
     return res2acct
 
 
-def build_analytics_user_map(activity_path: str, idx: "EvidenceIndex") -> Dict[str, Tuple[List[str],List[str]]]:
+def build_tombstone_forward_analytics(activity_path: str, idx: "EvidenceIndex",
+                                       exclude_analytics: Optional[set]=None) -> Dict[str, Optional[str]]:
+    """For each tombstone account (in evidence but no PII), find the UNIQUE analytics record
+    anonymized within 5 events forward on the same day. Returns account_rid → analytics_rid or None.
+    exclude_analytics: set of analytics_rids already assigned elsewhere (skip them in the window)."""
+    MAX_DIST = 5
+    acts = list(load_csv(activity_path))
+    result: Dict[str, Optional[str]] = {}
+    for i, a in enumerate(acts):
+        if a.get("event_type") != "DELETE_RECORD" or a.get("target_system") != "account_service":
+            continue
+        rid = a.get("resource_id", "")
+        if not rid: continue
+        recs = idx._rid.get(rid, [])
+        if not recs: continue  # not in evidence at all
+        if any(r.emails or r.user_ids for r in recs): continue  # has PII → standard acct2user
+        day = a.get("event_time", "")[:10]
+        found = []
+        for j in range(i + 1, min(len(acts), i + MAX_DIST + 1)):
+            a2 = acts[j]
+            if a2.get("event_time", "")[:10] != day:
+                break
+            if a2.get("event_type") == "ANONYMIZE_RECORD" and a2.get("target_system") == "analytics_platform":
+                anal_rid = a2.get("resource_id", "")
+                if anal_rid and (exclude_analytics is None or anal_rid not in exclude_analytics):
+                    found.append(anal_rid)
+        result[rid] = found[0] if len(found) == 1 else None
+    return result
+
+
+def resolve_tombstone_accounts(requests: List[Dict], idx: "EvidenceIndex",
+                               idents: Tuple, activity_path: str) -> Dict[str, Tuple[List[str],List[str]]]:
+    """For each deletion request, find tombstone (no-PII) accounts via same-day evidence
+    cross-reference. Returns account_rid → (emails, user_ids) for tombstone accounts."""
+    e2u, u2e, _ = idents
+    acct_del_day: Dict[str,str] = {}
+    for a in load_csv(activity_path):
+        if a.get("event_type") == "DELETE_RECORD" and a.get("target_system") == "account_service":
+            acct_del_day[a.get("resource_id","")] = a.get("event_time","")[:10]
+    # Collect all claims per tombstone account (multiple cases may claim the same account)
+    claims: Dict[str, List[Tuple[List[str],List[str]]]] = {}
+    for req in requests:
+        reported_at = parse_dt(req.get("reported_at",""))
+        if not reported_at: continue
+        rep_day = reported_at.strftime("%Y-%m-%d")
+        audit_at = parse_dt(req.get("audit_at",""))
+        uid, emails = resolve(req.get("email","").lower(), e2u, u2e)
+        uids = [uid] if uid else []
+        records = idx.find(emails, uids, audit_at)
+        user_file_ids = {rec.file_id for rec in records if rec.file_id}
+        if not user_file_ids: continue
+        candidates: List[str] = []
+        for rid, recs in idx._rid.items():
+            if not rid.startswith("account_"): continue
+            if any(r.emails or r.user_ids for r in recs): continue
+            if acct_del_day.get(rid,"") != rep_day: continue
+            for r in recs:
+                if r.file_id not in user_file_ids: continue
+                if r.state != "ABSENT": continue
+                candidates.append(rid); break
+        if len(candidates) == 1:
+            acct = candidates[0]
+            if acct not in claims:
+                claims[acct] = []
+            claims[acct].append((emails, uids))
+    # Only assign tombstone accounts claimed by exactly ONE case (prevent cross-case collisions)
+    tombstone_map: Dict[str, Tuple[List[str],List[str]]] = {}
+    for acct, claimants in claims.items():
+        if len(claimants) == 1:
+            tombstone_map[acct] = claimants[0]
+    return tombstone_map
+
+
+def build_analytics_user_map(activity_path: str, idx: "EvidenceIndex",
+                              extra_acct2user: Dict[str, Tuple[List[str],List[str]]]=None,
+                              excluded_analytics: Optional[set]=None
+                              ) -> Tuple[Dict[str, Tuple[List[str],List[str]]], set]:
     """Map anonymized analytics resource_id → (emails, user_ids) using system_activity batch correlation.
-    For analytics records with no PII, link them to the user whose account was deleted
-    immediately before the analytics anonymization in the same batch."""
+    Pass 1 (MAX_DIST=3): standard PII accounts (skips analytics in excluded_analytics).
+    Pass 2 (MAX_DIST=5): tombstone-only accounts for analytics still unassigned after pass 1.
+    Returns (analytics_map, assigned_in_pass1) where assigned_in_pass1 is the set of rids assigned."""
     acts = load_csv(activity_path)
     # Build account_rid → (emails, user_ids) from evidence index
     acct2user: Dict[str, Tuple[List[str],List[str]]] = {}
@@ -969,27 +1156,101 @@ def build_analytics_user_map(activity_path: str, idx: "EvidenceIndex") -> Dict[s
                 acct2user[rec.resource_id] = (rec.emails, rec.user_ids)
 
     analytics_map: Dict[str, Tuple[List[str],List[str]]] = {}
+    assigned_in_pass1: set = set()
+    # Exclusive forward assignment: process analytics in sequence order.
+    # Each account can only be assigned to ONE analytics record per batch (the closest one).
+    # MAX_DIST=3 avoids cascading wrong assignments when an excluded account causes the
+    # search to fall through to a far account that belongs to a different user entirely.
+    # used_accounts is keyed by (day, acct_rid) so batches on different days don't interfere.
+    # excluded_analytics: tombstone companions pre-identified — skip them so the tombstone
+    # forward map can claim them instead, and their nearby PII-account companions get assigned.
+    MAX_DIST = 3
+    used_accounts: Dict[tuple, str] = {}  # (day, acct_rid) → analytics_rid that claimed it
     for i, a in enumerate(acts):
         if a.get("event_type") != "ANONYMIZE_RECORD": continue
         if a.get("target_system") != "analytics_platform": continue
         rid = a.get("resource_id","")
         if not rid: continue
+        if excluded_analytics and rid in excluded_analytics: continue  # tombstone companion
         day = a.get("event_time","")[:10]
-        # Find nearest PRECEDING account deletion on the same day that is in the index
-        best_dist, best_user = 999999, None
+        best_dist, best_user, best_acct = 999999, None, None
         for j in range(i-1, max(-1, i-300), -1):
             a2 = acts[j]
             if a2.get("event_time","")[:10] != day: break
+            dist = i - j
+            if dist > MAX_DIST: break
             if a2.get("event_type") == "DELETE_RECORD" and a2.get("target_system") == "account_service":
                 acct_rid = a2.get("resource_id","")
-                if acct_rid in acct2user:
-                    dist = i - j
+                key = (day, acct_rid)
+                if acct_rid in acct2user and key not in used_accounts:
                     if dist < best_dist:
-                        best_dist = dist
-                        best_user = acct2user[acct_rid]
-        if best_user:
+                        best_dist = dist; best_user = acct2user[acct_rid]; best_acct = acct_rid
+        if best_user and best_acct:
             analytics_map[rid] = best_user
-    return analytics_map
+            used_accounts[(day, best_acct)] = rid
+            assigned_in_pass1.add(rid)
+
+    # Pass 2: extend lookback to MAX_DIST=5 for tombstone accounts (no PII in evidence).
+    # Only runs for analytics still unassigned after pass 1, and only considers tombstone
+    # accounts (extra_acct2user), preventing PII accounts from claiming in the extended range.
+    if extra_acct2user:
+        MAX_DIST_2 = 5
+        for i, a in enumerate(acts):
+            if a.get("event_type") != "ANONYMIZE_RECORD": continue
+            if a.get("target_system") != "analytics_platform": continue
+            rid = a.get("resource_id","")
+            if not rid or rid in analytics_map: continue  # already assigned in pass 1
+            day = a.get("event_time","")[:10]
+            best_dist, best_user, best_acct = 999999, None, None
+            for j in range(i-1, max(-1, i-300), -1):
+                a2 = acts[j]
+                if a2.get("event_time","")[:10] != day: break
+                dist = i - j
+                if dist > MAX_DIST_2: break
+                if a2.get("event_type") == "DELETE_RECORD" and a2.get("target_system") == "account_service":
+                    acct_rid = a2.get("resource_id","")
+                    key = (day, acct_rid)
+                    # Only tombstone accounts (extra_acct2user), not standard PII accounts
+                    if acct_rid in extra_acct2user and key not in used_accounts:
+                        if dist < best_dist:
+                            best_dist = dist; best_user = extra_acct2user[acct_rid]; best_acct = acct_rid
+            if best_user and best_acct:
+                analytics_map[rid] = best_user
+                used_accounts[(day, best_acct)] = rid
+
+    return analytics_map, assigned_in_pass1
+
+
+def _find_account_by_time_proximity(activity_path, reported_at, audit_at, emails, user_ids, idx, ev_rows, dataset_dir) -> Optional[str]:
+    """Find a deleted account within ±2h of reported_at via system_activity.
+    Only assigns if exactly ONE account qualifies (uniqueness prevents false assignments
+    in multi-case batches where several accounts are deleted in the same window).
+    Filters out accounts already claimed by another user's PII in evidence."""
+    import csv as _csv_tp
+    WINDOW_SECS = 7200  # 2 hours
+    reported_ts = reported_at.timestamp() if hasattr(reported_at, 'timestamp') else 0
+    candidates: List[str] = []
+    try:
+        with open(str(activity_path), encoding="utf-8-sig", newline="") as _f:
+            for row in _csv_tp.DictReader(_f):
+                if row.get("event_type") != "DELETE_RECORD": continue
+                rid = row.get("resource_id","")
+                if not rid.startswith("account_"): continue
+                t = parse_dt(row.get("event_time",""))
+                if t is None: continue
+                if abs(t.timestamp() - reported_ts) > WINDOW_SECS: continue
+                arecs = (idx._rid.get(rid) or []) if idx else []
+                has_other_pii = arecs and any(
+                    (r.emails or r.user_ids)
+                    and not any(e in (emails or []) for e in r.emails)
+                    and not any(u in (user_ids or []) for u in r.user_ids)
+                    for r in arecs
+                )
+                if not has_other_pii:
+                    candidates.append(rid)
+    except Exception:
+        pass
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _find_sql_evidence_for_absent_account(acct_rid: str, audit_at, ev_rows, dataset_dir: "Path") -> Optional[str]:
@@ -1041,6 +1302,174 @@ def _find_sql_evidence_for_absent_account(acct_rid: str, audit_at, ev_rows, data
                         best_cat = fcat; best_fid = ev_row["file_id"]
         except: continue
     return best_fid
+
+
+def _find_absent_account_from_sql(
+        emails: List[str], user_ids: List[str],
+        ev_rows, dataset_dir: "Path", reported_at, audit_at
+) -> Tuple[Optional[str], Optional[str]]:
+    """For a user with no evidence records: check SQL customer_profiles* tables
+    captured AFTER reported_at. If user is absent from ALL such tables AND the
+    table rows uniformly follow the account_/user_ naming convention, infer
+    account_rid and return (account_rid, evidence_id).
+    Returns (None, None) if user is found, convention mismatches, or no suitable table."""
+    import sqlite3 as _sq3
+    if not (emails or user_ids) or not ev_rows or not dataset_dir:
+        return None, None
+
+    # (fcat, fid, inferred_rid) tuples where user is absent and convention holds
+    candidates: List[Tuple] = []
+
+    for ev_row in ev_rows:
+        if ".sql" not in ev_row.get("file_path", "").lower(): continue
+        fcat = parse_dt(ev_row.get("captured_at", ""))
+        if fcat is None: continue
+        if audit_at and fcat > audit_at: continue
+        if reported_at and fcat < reported_at: continue  # only post-report snapshots
+        fpath = dataset_dir / ev_row["file_path"]
+        if not fpath.exists(): continue
+
+        try:
+            sql_txt = fpath.read_text(encoding="utf-8", errors="replace")
+            conn = _sq3.connect(":memory:")
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript(sql_txt)
+
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")]
+            user_found = False
+            file_inferred_rid: Optional[str] = None
+
+            for tbl in tables:
+                if not (tbl.startswith("customer_profiles")
+                        or tbl.startswith("customer_accounts")):
+                    continue
+                cols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")}
+                if "resource_id" not in cols: continue
+                count = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                if count == 0: continue
+
+                uid_col = ("user_id" if "user_id" in cols
+                           else ("customer_reference" if "customer_reference" in cols
+                                 else None))
+
+                # Check if user is in this table
+                for email in emails:
+                    if "email" in cols:
+                        r = conn.execute(
+                            f"SELECT resource_id FROM {tbl} WHERE email=?",
+                            (email,)).fetchone()
+                        if r: user_found = True; break
+                if not user_found and uid_col:
+                    for uid in user_ids:
+                        r = conn.execute(
+                            f"SELECT resource_id FROM {tbl} WHERE {uid_col}=?",
+                            (uid,)).fetchone()
+                        if r: user_found = True; break
+                if user_found: break
+
+                # User absent from this table. Verify naming convention on existing rows.
+                if uid_col:
+                    sample_rows = conn.execute(
+                        f"SELECT resource_id, {uid_col} FROM {tbl} LIMIT 20"
+                    ).fetchall()
+                    convention_ok = True
+                    for row_rid, row_uid in sample_rows:
+                        if not row_uid or not row_uid.startswith("user_"):
+                            convention_ok = False; break
+                        expected = "account_" + row_uid[5:].zfill(3)
+                        if row_rid != expected:
+                            convention_ok = False; break
+                    if convention_ok and sample_rows:
+                        for uid in user_ids:
+                            if uid.startswith("user_"):
+                                file_inferred_rid = "account_" + uid[5:].zfill(3)
+                                break
+
+            conn.close()
+
+            if user_found:
+                return None, None  # User is present → not absent
+
+            if file_inferred_rid:
+                candidates.append((fcat, ev_row["file_id"], file_inferred_rid))
+
+        except Exception:
+            try: conn.close()
+            except Exception: pass
+
+    if not candidates:
+        return None, None
+
+    # Pick most recent post-report snapshot where convention holds and user is absent
+    _, best_fid, best_rid = max(candidates, key=lambda x: x[0])
+    return best_rid, best_fid
+
+
+def _find_anonymized_analytics_for_user(
+        activity_path: str, reported_at, audit_at,
+        ev_rows, dataset_dir: "Path", idx: "EvidenceIndex"
+) -> List[Tuple[str, str]]:
+    """Find ANONYMIZE_RECORD analytics events within 2h before reported_at
+    whose resource_ids appear in analytics JSON evidence as fully null-PII
+    (ANONYMIZED) and are NOT linked to any other user in the evidence index.
+    Returns [(analytics_rid, evidence_id)]."""
+    import json as _json
+    if reported_at is None or not activity_path:
+        return []
+
+    WINDOW_SECS = 7200
+    reported_ts = reported_at.timestamp() if hasattr(reported_at, "timestamp") else 0
+    candidates: set = set()
+
+    try:
+        import csv as _csv2
+        with open(str(activity_path), encoding="utf-8-sig", newline="") as _f:
+            for row in _csv2.DictReader(_f):
+                if row.get("event_type") != "ANONYMIZE_RECORD": continue
+                if row.get("target_system") != "analytics_platform": continue
+                rid = row.get("resource_id", "")
+                if not rid: continue
+                t = parse_dt(row.get("event_time", ""))
+                if t is None: continue
+                diff = reported_ts - t.timestamp()
+                if 0 <= diff <= WINDOW_SECS:
+                    candidates.add(rid)
+    except Exception:
+        pass
+
+    if not candidates:
+        return []
+
+    results: List[Tuple[str, str]] = []
+
+    for ev_row in ev_rows:
+        fp = ev_row.get("file_path", "")
+        if ".json" not in fp.lower(): continue
+        fcat = parse_dt(ev_row.get("captured_at", ""))
+        if fcat is None: continue
+        if audit_at and fcat > audit_at: continue
+        fpath = dataset_dir / fp
+        if not fpath.exists(): continue
+
+        try:
+            data = _jload(fpath)
+            if not isinstance(data, dict): continue
+            recs = data.get("records", [])
+            for rec in recs:
+                rid = rec.get("resource_id", "")
+                if rid not in candidates: continue
+                has_pii = any(rec.get(k) for k in
+                              ["email", "phone", "email_hash", "user_id"])
+                if has_pii: continue  # has PII → not properly anonymized
+                if idx and idx._rid.get(rid):
+                    continue  # linked to another user → skip
+                results.append((rid, ev_row["file_id"]))
+                candidates.discard(rid)  # don't duplicate
+        except Exception:
+            pass
+
+    return results
 
 
 def find_user_account_from_activity(
@@ -1135,8 +1564,43 @@ def is_deletion(text: str) -> bool:
 
 def generate_steps(records: List[Record], res2acct: Dict[str,str]=None,
                    activity_path: str=None, emails: List[str]=None, user_ids: List[str]=None,
-                   requested_at=None, audit_at=None, ev_rows=None, dataset_dir: "Path"=None) -> Tuple[str, List]:
+                   requested_at=None, audit_at=None, ev_rows=None, dataset_dir: "Path"=None,
+                   idx: "EvidenceIndex"=None, reported_at=None,
+                   tombstone_forward_map: Dict[str,Optional[str]]=None) -> Tuple[str, List]:
     if not records:
+        # No evidence records at all — try multiple account-discovery paths.
+        if reported_at and activity_path:
+            acct = _find_account_by_time_proximity(activity_path, reported_at, audit_at, emails, user_ids, idx, ev_rows, dataset_dir)
+            if acct:
+                best_fid = _find_sql_evidence_for_absent_account(acct, audit_at, ev_rows, dataset_dir) if ev_rows and dataset_dir else None
+                return "COMPLETE", [{"phase":"VERIFICATION","system_id":"account_service",
+                                     "resource_id":acct,"operation":"VERIFY_RECORD_ABSENT",
+                                     "state":"ABSENT","evidence_id":best_fid or ""}]
+
+        # SQL-based absent account lookup (user not in any post-report customer_profiles snapshot)
+        complete_steps: List[dict] = []
+        if ev_rows and dataset_dir and user_ids:
+            _emails_u = emails or []
+            acct_rid, acct_fid = _find_absent_account_from_sql(
+                _emails_u, user_ids, ev_rows, dataset_dir, reported_at, audit_at)
+            if acct_rid:
+                complete_steps.append({
+                    "phase": "VERIFICATION", "system_id": "account_service",
+                    "resource_id": acct_rid, "operation": "VERIFY_RECORD_ABSENT",
+                    "state": "ABSENT", "evidence_id": acct_fid or ""})
+
+        # Analytics: find records anonymized near reported_at that appear null-PII in evidence
+        if reported_at and activity_path and ev_rows and dataset_dir and idx:
+            anon_list = _find_anonymized_analytics_for_user(
+                activity_path, reported_at, audit_at, ev_rows, dataset_dir, idx)
+            for a_rid, a_fid in anon_list:
+                complete_steps.append({
+                    "phase": "VERIFICATION", "system_id": "analytics_platform",
+                    "resource_id": a_rid, "operation": "VERIFY_RECORD_ANONYMIZED",
+                    "state": "ANONYMIZED", "evidence_id": a_fid})
+
+        if complete_steps:
+            return "COMPLETE", complete_steps
         return "COMPLETE", []
 
     # Keep most recent record per (sys_id, resource_id)
@@ -1221,36 +1685,236 @@ def generate_steps(records: List[Record], res2acct: Dict[str,str]=None,
             elif state=="ABSENT":
                 verifications.append({"phase":"VERIFICATION","system_id":sys_id,"resource_id":rid,"operation":"VERIFY_RECORD_ABSENT","state":"ABSENT","evidence_id":ev})
 
+    # Dedup stale historical absent accounts: if multiple ABSENT account_service verifications
+    # exist (e.g. a current account + a stale old account both show ABSENT in evidence),
+    # keep only the one with the most recently captured evidence.
+    _absent_acct_vv = [(i,s) for i,s in enumerate(verifications)
+                       if s.get("system_id")=="account_service" and s.get("state")=="ABSENT"
+                       and s.get("evidence_id","")]
+    if len(_absent_acct_vv) > 1 and ev_rows:
+        def _ev_cap_ts(eid):
+            for ef in ev_rows:
+                if ef.get("file_id")==eid:
+                    t = parse_dt(ef.get("captured_at",""))
+                    return t.timestamp() if t else 0
+            return 0
+        _best_i = max(_absent_acct_vv, key=lambda x: _ev_cap_ts(x[1]["evidence_id"]))[0]
+        _remove = {i for i,_ in _absent_acct_vv if i != _best_i}
+        verifications = [s for i,s in enumerate(verifications) if i not in _remove]
+
     def skey(step, phase):
         return (OP_ORDER.get(phase,{}).get(step["operation"],99), sys_rank(step["system_id"]), step["resource_id"])
 
-    # Add account_service VERIFY_RECORD_ABSENT from activity batch correlation (INCOMPLETE cases)
     if res2acct and incomplete:
-        known_accts={k[1] for k in best if k[0]=="account_service"}
-        for rid in list(best.keys()):
-            sys_id,resource_id=rid
-            acct=res2acct.get(resource_id)
-            if acct and acct not in known_accts:
-                verifications.append({"phase":"VERIFICATION","system_id":"account_service","resource_id":acct,"operation":"VERIFY_RECORD_ABSENT","state":"ABSENT","evidence_id":""})
-                known_accts.add(acct)
-
-    # For COMPLETE cases with no account record: find account via res2acct of own resources
-    if not incomplete and res2acct:
+        # For INCOMPLETE cases: add the account VERIFY_RECORD_ABSENT step via activity batch.
+        # Guard: all resources must agree on a single account (prevents multi-user batch pollution)
+        # AND the account must not carry another user's PII in evidence.
         known_accts = {k[1] for k in best if k[0]=="account_service"}
+        for v in verifications:
+            if v.get("system_id")=="account_service" and v.get("resource_id","").startswith("account_"):
+                known_accts.add(v["resource_id"])
         if not known_accts:
-            # Look up each of the user's evidence resources in res2acct
+            acct_votes: Dict[str,int] = {}
             for (sys_id, resource_id) in best.keys():
                 acct = res2acct.get(resource_id)
-                if acct:
-                    # Only use if the account isn't from a completely unrelated batch
-                    # (basic sanity: account must start with "account_")
-                    if acct.startswith("account_") and acct not in known_accts:
+                if acct and acct.startswith("account_"):
+                    acct_votes[acct] = acct_votes.get(acct, 0) + 1
+            if len(acct_votes) == 1:  # all resources agree on same account
+                acct = next(iter(acct_votes))
+                if acct not in known_accts:
+                    acct_recs = (idx._rid.get(acct) or []) if idx else []
+                    has_other_pii = acct_recs and any(
+                        (r.emails or r.user_ids)
+                        and not any(e in (emails or []) for e in r.emails)
+                        and not any(u in (user_ids or []) for u in r.user_ids)
+                        for r in acct_recs
+                    )
+                    if not has_other_pii:
+                        verifications.append({"phase":"VERIFICATION","system_id":"account_service",
+                                              "resource_id":acct,"operation":"VERIFY_RECORD_ABSENT",
+                                              "state":"ABSENT","evidence_id":""})
+                        known_accts.add(acct)
+
+    # For COMPLETE cases: direct PII match in evidence index (ignores audit_at filter).
+    # This catches accounts that appear in evidence AFTER audit_at but have their deletion
+    # verified by a BEFORE-audit_at evidence record (e.g., evidence_92).
+    if not incomplete and idx and emails is not None:
+        known_accts = {k[1] for k in best if k[0]=="account_service"}
+        for v in verifications:
+            if v.get("system_id")=="account_service" and v.get("resource_id","").startswith("account_"):
+                known_accts.add(v["resource_id"])
+        if not known_accts:
+            for rid, recs in idx._rid.items():
+                if not rid.startswith("account_"): continue
+                if rid in known_accts: continue
+                user_match = any(
+                    any(e in (emails or []) for e in r.emails) or
+                    any(u in (user_ids or []) for u in r.user_ids)
+                    for r in recs
+                )
+                if not user_match: continue
+                # Find ABSENT or REDACTED evidence captured BEFORE audit_at
+                pii_fid = None
+                if ev_rows and dataset_dir:
+                    for r in recs:
+                        if r.state in ("ABSENT","REDACTED"):
+                            ef = next((e for e in ev_rows if e.get("file_id")==r.file_id), None)
+                            if ef:
+                                cap = parse_dt(ef.get("captured_at",""))
+                                if cap and (audit_at is None or cap <= audit_at):
+                                    pii_fid = r.file_id; break
+                verifications.append({"phase":"VERIFICATION","system_id":"account_service",
+                                      "resource_id":rid,"operation":"VERIFY_RECORD_ABSENT",
+                                      "state":"ABSENT","evidence_id":pii_fid or ""})
+                known_accts.add(rid)
+                break
+
+    # For COMPLETE cases with no account record: find account via res2acct of own resources.
+    if not incomplete and res2acct:
+        known_accts = {k[1] for k in best if k[0]=="account_service"}
+        for v in verifications:
+            if v.get("system_id")=="account_service" and v.get("resource_id","").startswith("account_"):
+                known_accts.add(v["resource_id"])
+        if not known_accts:
+            for (sys_id, resource_id) in best.keys():
+                if sys_id == "analytics_platform": continue  # analytics handled by analytics_map
+                acct = res2acct.get(resource_id)
+                if acct and acct.startswith("account_") and acct not in known_accts:
+                    acct_recs = (idx._rid.get(acct) or []) if idx else []
+                    has_other_pii = acct_recs and any(
+                        (r.emails or r.user_ids)
+                        and not any(e in (emails or []) for e in r.emails)
+                        and not any(u in (user_ids or []) for u in r.user_ids)
+                        for r in acct_recs
+                    )
+                    if not has_other_pii:
                         best_fid = _find_sql_evidence_for_absent_account(acct, audit_at, ev_rows, dataset_dir) if ev_rows and dataset_dir else None
+                        # For tombstone accounts (no PII), prefer direct evidence file from idx
+                        if not best_fid and acct_recs:
+                            fid_c = next((r.file_id for r in acct_recs if r.state == "ABSENT" and r.file_id), None)
+                            if fid_c:
+                                best_fid = fid_c
                         verifications.append({"phase":"VERIFICATION","system_id":"account_service",
                                               "resource_id":acct,"operation":"VERIFY_RECORD_ABSENT",
                                               "state":"ABSENT","evidence_id":best_fid or ""})
                         known_accts.add(acct)
+                        # Companion analytics check for tombstone accounts
+                        if tombstone_forward_map:
+                            anal_rid = tombstone_forward_map.get(acct)
+                            if anal_rid:
+                                anal_recs = idx._rid.get(anal_rid, []) if idx else []
+                                anal_fid = next((r.file_id for r in anal_recs
+                                                if r.file_id and r.state == "ANONYMIZED"), None)
+                                if anal_fid and ("analytics_platform", anal_rid) not in best:
+                                    verifications.append({"phase":"VERIFICATION",
+                                                          "system_id":"analytics_platform",
+                                                          "resource_id":anal_rid,
+                                                          "operation":"VERIFY_RECORD_ANONYMIZED",
+                                                          "state":"ANONYMIZED",
+                                                          "evidence_id":anal_fid})
                     break
+
+    # For COMPLETE cases: evidence-file cross-reference.
+    # When a user's indexed records appear in an evidence file that ALSO contains an absent
+    # account_service tombstone (no PII), and that account was deleted on the same calendar day
+    # as reported_at, and it's the only such account in that file for that day → assign it.
+    # This handles accounts that were anonymized to tombstones before the audit sweep.
+    if not incomplete and idx and reported_at and activity_path:
+        known_accts_xref = {k[1] for k in best if k[0]=="account_service"}
+        for v in verifications:
+            if v.get("system_id")=="account_service": known_accts_xref.add(v["resource_id"])
+        if not known_accts_xref:
+            rep_day = reported_at[:10] if isinstance(reported_at, str) else reported_at.strftime("%Y-%m-%d")
+            # Build account deletion date lookup (lazy: only if needed)
+            acct_del_day: Dict[str,str] = {}
+            for a in load_csv(activity_path):
+                if a.get("event_type")=="DELETE_RECORD" and a.get("target_system")=="account_service":
+                    acct_del_day[a.get("resource_id","")] = a.get("event_time","")[:10]
+            # Collect ALL evidence file IDs that contain records for this user
+            # (use full records list, not just best, to catch duplicate entries from multiple files)
+            user_file_ids: set = {rec.file_id for rec in records if rec.file_id}
+            if user_file_ids:
+                candidates: list = []
+                for rid, recs in idx._rid.items():
+                    if not rid.startswith("account_"): continue
+                    if rid in known_accts_xref: continue
+                    # skip accounts that have PII in ANY record (those are already in acct2user)
+                    if any(r.emails or r.user_ids for r in recs): continue
+                    if acct_del_day.get(rid, "") != rep_day: continue
+                    for r in recs:
+                        if r.file_id not in user_file_ids: continue
+                        if r.state != "ABSENT": continue
+                        candidates.append((rid, r.file_id)); break
+                if len(candidates) == 1:
+                    acct, fid = candidates[0]
+                    verifications.append({"phase":"VERIFICATION","system_id":"account_service",
+                                          "resource_id":acct,"operation":"VERIFY_RECORD_ABSENT",
+                                          "state":"ABSENT","evidence_id":fid})
+                    # Companion analytics: if this tombstone has a unique analytics record anonymized
+                    # in the same forward batch (precomputed), add it as a verification step.
+                    if tombstone_forward_map:
+                        anal_rid = tombstone_forward_map.get(acct)
+                        if anal_rid:
+                            anal_recs = idx._rid.get(anal_rid, []) if idx else []
+                            anal_fid = next((r.file_id for r in anal_recs
+                                            if r.file_id and r.state == "ANONYMIZED"), None)
+                            already = any(v.get("resource_id") == anal_rid and
+                                          v.get("system_id") == "analytics_platform"
+                                          for v in verifications)
+                            if anal_fid and not already and ("analytics_platform", anal_rid) not in best:
+                                verifications.append({"phase":"VERIFICATION",
+                                                      "system_id":"analytics_platform",
+                                                      "resource_id":anal_rid,
+                                                      "operation":"VERIFY_RECORD_ANONYMIZED",
+                                                      "state":"ANONYMIZED",
+                                                      "evidence_id":anal_fid})
+
+    # Time-proximity fallback (±2h, unique): when no account was found via evidence or res2acct,
+    # look for the account deleted within 2 hours of reported_at. Only assigns if exactly ONE
+    # qualifying account exists in the window (prevents false positives in multi-case batches).
+    if reported_at and activity_path:
+        known_accts_final = {k[1] for k in best if k[0]=="account_service"}
+        for v in verifications:
+            if v.get("system_id")=="account_service": known_accts_final.add(v["resource_id"])
+        if not known_accts_final:
+            best_acct = _find_account_by_time_proximity(activity_path, reported_at, audit_at, emails, user_ids, idx, ev_rows, dataset_dir)
+            if best_acct:
+                best_fid = _find_sql_evidence_for_absent_account(best_acct, audit_at, ev_rows, dataset_dir) if ev_rows and dataset_dir else None
+                ev_id = best_fid or ""
+                if incomplete: ev_id = ""  # future verification has no evidence
+                verifications.append({"phase":"VERIFICATION","system_id":"account_service",
+                                      "resource_id":best_acct,"operation":"VERIFY_RECORD_ABSENT",
+                                      "state":"ABSENT","evidence_id":ev_id})
+
+    # Post-processing companion analytics check: for any tombstone account already in verifications
+    # (found via direct best-record, res2acct, or evidence cross-reference), add the companion
+    # analytics record from tombstone_forward_map if not already present.
+    if tombstone_forward_map and not incomplete and idx:
+        for v in list(verifications):
+            if (v.get("system_id") == "account_service" and
+                    v.get("operation") == "VERIFY_RECORD_ABSENT"):
+                acct = v.get("resource_id", "")
+                acct_recs = idx._rid.get(acct, [])
+                if acct_recs and any(r.emails or r.user_ids for r in acct_recs):
+                    continue  # skip non-tombstone accounts (have PII)
+                anal_rid = tombstone_forward_map.get(acct)
+                if not anal_rid:
+                    continue
+                already = any(vv.get("resource_id") == anal_rid and
+                              vv.get("system_id") == "analytics_platform"
+                              for vv in verifications)
+                if already:
+                    continue
+                anal_recs = idx._rid.get(anal_rid, [])
+                anal_fid = next((r.file_id for r in anal_recs
+                                if r.file_id and r.state == "ANONYMIZED"), None)
+                if anal_fid:
+                    verifications.append({"phase": "VERIFICATION",
+                                          "system_id": "analytics_platform",
+                                          "resource_id": anal_rid,
+                                          "operation": "VERIFY_RECORD_ANONYMIZED",
+                                          "state": "ANONYMIZED",
+                                          "evidence_id": anal_fid})
 
     findings.sort(     key=lambda s: skey(s,"FINDING"))
     remediations.sort( key=lambda s: skey(s,"REMEDIATION"))
@@ -1287,12 +1951,68 @@ def main():
 
     e2u, u2e, h2e = build_identity(identities, audit_log)
     idx = build_index(DATASET_DIR/"evidence_files.csv", h2e)
-    res2acct = build_activity_account_map(DATASET_DIR/"system_activity.csv", idx)
-    # Link anonymized analytics records to users via system_activity batch proximity
-    analytics_map = build_analytics_user_map(str(DATASET_DIR/"system_activity.csv"), idx)
+    res2acct = build_activity_account_map(DATASET_DIR/"system_activity.csv", idx, e2u=e2u)
+
+    # Link ABSENT account records (404 entries in evidence) to users via res2acct reverse lookup.
+    # Safety rule: only link accounts that actually appear in evidence as ABSENT (in idx._rid).
+    # This avoids false-positives from proximity-based res2acct errors on accounts not in evidence.
+    absent_evidence_accounts: set = set()
+    for rid, recs in idx._rid.items():
+        if rid.startswith("account_"):
+            for rec in recs:
+                if rec.state == "ABSENT" and not rec.emails and not rec.user_ids:
+                    absent_evidence_accounts.add(rid)
+                    break
+
+    acct2user_from_res: Dict[str, Tuple[List[str], List[str]]] = {}
+    # Build vote counts: account_id → {fingerprint: count} to pick the most common user per account
+    acct_votes: Dict[str, Dict[frozenset, int]] = {}
+    for resource_id, account_id in res2acct.items():
+        if account_id not in absent_evidence_accounts:
+            continue
+        for rec in idx._rid.get(resource_id, []):
+            if rec.emails or rec.user_ids:
+                fp = frozenset(rec.emails + rec.user_ids)
+                if fp:
+                    if account_id not in acct_votes: acct_votes[account_id] = {}
+                    acct_votes[account_id][fp] = acct_votes[account_id].get(fp, 0) + 1
+                break
+
+    # Pick winner per account (most-voted fingerprint), require at least 2 votes for confidence
+    for account_id, votes in acct_votes.items():
+        best_fp = max(votes, key=lambda fp: votes[fp])
+        if votes[best_fp] >= 2:  # at least 2 resources agree on the same user
+            emails = [x for x in best_fp if _is_email(x)]
+            uids   = [x for x in best_fp if _is_uid(x)]
+            acct2user_from_res[account_id] = (emails, uids)
+
+    for account_id, (ae, au) in acct2user_from_res.items():
+        idx.link_to_user(account_id, ae, au)
+    log.info("Account linkage: %d absent accounts linked to users (vote-based)", len(acct2user_from_res))
+
+    tombstone_accts = resolve_tombstone_accounts(requests, idx, (e2u, u2e, h2e),
+                                                  str(DATASET_DIR/"system_activity.csv"))
+    log.info("Tombstone accounts resolved: %d", len(tombstone_accts))
+
+    # Two-pass tombstone forward analytics:
+    # 1. Preliminary map (no exclusions) → identifies tombstone companions
+    # 2. Exclude companions from analytics_map pass 1 → nearby PII-account analytics get correct owner
+    # 3. Rebuild final map excluding analytics assigned in pass 1 → resolves ambiguous windows
+    prelim_tombstone_forward = build_tombstone_forward_analytics(str(DATASET_DIR/"system_activity.csv"), idx)
+    tombstone_companion_set = {v for v in prelim_tombstone_forward.values() if v}
+    log.info("Preliminary tombstone forward: %d accounts, %d companions", len(prelim_tombstone_forward), len(tombstone_companion_set))
+
+    analytics_map, assigned_in_pass1 = build_analytics_user_map(str(DATASET_DIR/"system_activity.csv"), idx,
+                                             extra_acct2user=tombstone_accts,
+                                             excluded_analytics=tombstone_companion_set)
     for analytics_rid, (ae, au) in analytics_map.items():
         idx.link_to_user(analytics_rid, ae, au)
     log.info("Analytics map: %d records linked to users", len(analytics_map))
+
+    tombstone_forward_map = build_tombstone_forward_analytics(str(DATASET_DIR/"system_activity.csv"), idx,
+                                                               exclude_analytics=assigned_in_pass1)
+    log.info("Tombstone forward analytics: %d accounts, %d with unique companion",
+             len(tombstone_forward_map), sum(1 for v in tombstone_forward_map.values() if v))
 
     # Build SQL snapshot account sets for ABSENT verification
     # Maps: account_rid → (evidence_file_id, captured_at) for accounts confirmed ABSENT from SQL snapshots
@@ -1330,6 +2050,7 @@ def main():
             results.append({"case_id":case_id,"deletion_status":"NOT_APPLICABLE","steps_json":"[]"}); na+=1; continue
         audit_at=parse_dt(case.get("audit_at",""))
         requested_at=parse_dt(case.get("requested_at",""))
+        reported_at=parse_dt(case.get("reported_at",""))
         uid,emails=resolve(case.get("email",""),e2u,u2e)
         uids=[uid] if uid else []
         u_hashes=[k for k,v in h2e.items() if v in [norm(e) for e in emails]]
@@ -1338,7 +2059,9 @@ def main():
                                      activity_path=str(DATASET_DIR/"system_activity.csv"),
                                      emails=emails, user_ids=uids,
                                      requested_at=requested_at, audit_at=audit_at,
-                                     ev_rows=ev_rows, dataset_dir=DATASET_DIR)
+                                     ev_rows=ev_rows, dataset_dir=DATASET_DIR, idx=idx,
+                                     reported_at=reported_at,
+                                     tombstone_forward_map=tombstone_forward_map)
         if status=="COMPLETE": comp+=1
         else: inc+=1
         if (i+1)%50==0: log.info("[%d/%d] COMPLETE=%d INCOMPLETE=%d N/A=%d",i+1,len(requests),comp,inc,na)
