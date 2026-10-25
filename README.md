@@ -31,7 +31,7 @@ Benchmarked on 32 labeled sample cases:
 
 Given a list of deletion requests and a set of evidence files (database snapshots, logs, JSON exports, PDFs), the agent:
 
-1. **Determines intent** — reads `request_text` in any language and decides if it actually authorizes deletion (requests for data access, export, or marketing opt-out are classified `NOT_APPLICABLE`)
+1. **Classifies intent via LLM** — sends `request_text` to a Groq-hosted LLM (qwen/qwen3.8-27b) to determine if the request authorizes deletion in any language. Requests for data access, export, or marketing opt-out are classified `NOT_APPLICABLE`. Falls back to heuristic keyword matching if the API is unavailable.
 2. **Resolves all identifiers** — combines the current user profile with the full audit history to recover past emails, hashed values, and internal IDs that still appear in older systems
 3. **Indexes all evidence** — parses every file type (SQL snapshots via in-memory SQLite, JSON exports, structured logs, plain-text records, PDFs) and builds a lookup table keyed by every identifier linked to the user
 4. **Applies deletion policy** — checks each record against `deletion_rules.csv` (DELETE, REDACT, ANONYMIZE, RETAIN, ACCOUNT_TOMBSTONE)
@@ -62,7 +62,13 @@ Steps always follow the order: **FINDING → REMEDIATION → VERIFICATION**. Wit
 
 ## Architecture
 
-The agent is fully deterministic — no LLM calls at runtime, no external APIs, no randomness.
+The agent uses a two-layer design: an LLM for intent classification, and a deterministic rule engine for everything else.
+
+### LLM Layer — Intent Classification (Groq)
+
+Each case's `request_text` is sent to **qwen/qwen3.8-27b** via the Groq API with a system prompt that distinguishes deletion requests from access, export, and opt-out requests. The model handles multilingual input reliably. One API call per case (518 total). If the API is unavailable, the agent falls back to regex-based heuristic classification automatically.
+
+### Deterministic Layer — Evidence Analysis
 
 ### Identity Resolution
 
@@ -105,14 +111,25 @@ Ordering: `DISABLE_DATA_FLOW` and `BLOCK_RESTORE` before any `DELETE_RECORD`/`RE
 ```bash
 git clone https://github.com/karterisg/HACKERRANK-ORCHESTRATE-OCT26
 cd HACKERRANK-ORCHESTRATE-OCT26
-python code/main.py
+pip install groq python-dotenv
 ```
 
-**Requires Python 3.9+. No external packages — uses only the standard library.**
+Create a `.env` file at the repo root:
+
+```
+GROQ_API_KEY=your_key_here
+```
+
+Get a free API key at `console.groq.com` (no credit card required, 14,400 requests/day free tier).
+
+**Requires Python 3.9+.**
 
 Input files go under `dataset/`. Output is written to `output.csv` at the repo root.
 
 ```bash
+# Run all 518 cases
+python code/main.py
+
 # Run against the 32 labeled sample cases and compare to known answers
 python code/main.py --sample
 python code/validate.py
