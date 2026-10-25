@@ -59,14 +59,14 @@ SYSTEM_CATEGORY = {
     "marketing_platform":  "MARKETING_PROFILE",
 }
 
-REQUIRED_ACTION = {
+_REQUIRED_ACTION_FALLBACK = {
     "USER_PROFILE":        "DELETE",
     "SECONDARY_IDENTIFIER":"DELETE",
     "SEARCH_INDEX_ENTRY":  "DELETE",
     "CACHE_ENTRY":         "DELETE",
     "SUPPORT_MESSAGE":     "REDACT",
     "SUPPORT_ATTACHMENT":  "DELETE",
-    "SUPPORT_RECORD":      "DELETE",   # default when record_type unknown
+    "SUPPORT_RECORD":      "DELETE",
     "ANALYTICS_PROFILE":   "ANONYMIZE",
     "PRODUCT_TELEMETRY":   "ANONYMIZE",
     "USER_EXPORT":         "DELETE",
@@ -78,6 +78,25 @@ REQUIRED_ACTION = {
     "ACCOUNT_TOMBSTONE":   "REDACT",
     "INTEGRATION_FLOW":    "DISABLE",
 }
+
+def _load_required_actions_from_csv(rules_path: "Path") -> dict:
+    """Load required_action mapping from deletion_rules.csv. Falls back to hardcoded if unavailable."""
+    try:
+        mapping = dict(_REQUIRED_ACTION_FALLBACK)  # start with fallback
+        for row in load_csv(rules_path):
+            cat = row.get("data_category", "").strip()
+            action = row.get("required_action", "").strip().upper()
+            if not cat or not action:
+                continue
+            # Normalize: ACCOUNT_TOMBSTONE action in CSV is REDACT
+            mapping[cat] = action
+        log.info("Loaded deletion policy from %s (%d rules)", rules_path.name, len(mapping))
+        return mapping
+    except Exception as e:
+        log.warning("Could not load deletion_rules.csv (%s) — using hardcoded policy", e)
+        return dict(_REQUIRED_ACTION_FALLBACK)
+
+REQUIRED_ACTION: dict = {}  # populated at startup from deletion_rules.csv
 
 SYSTEM_ORDER = [
     "account_service","analytics_platform","backup_service",
@@ -633,6 +652,135 @@ def _pdf_extract_text(path) -> str:
     return " ".join(s.decode('ascii', 'ignore') for s in strings)
 
 
+_GROQ_PARSE_SYSTEM = """\
+You are a GDPR deletion audit assistant. Extract every personal data record from the evidence file provided.
+Return one JSON object per line. Each JSON must contain:
+  resource_id   (string, e.g. account_001)
+  system_id     (one of: account_service, analytics_platform, backup_service, export_service,
+                 integration_service, marketing_platform, search_service, security_service,
+                 support_platform, identity_service — infer from resource_id prefix if not stated)
+  email         (string or "")
+  user_id       (string matching user_\\d+ pattern, or "")
+  state         (one of: PRESENT, ABSENT, REDACTED, ANONYMIZED, ACTIVE, DISABLED, BLOCKED)
+
+Rules:
+- PRESENT = record exists and contains personal data
+- ABSENT = record was deleted / not found (HTTP 404, rows=0, account_status=DELETED)
+- REDACTED = record exists but PII fields are removed
+- ANONYMIZED = record exists but cannot be linked to an individual
+- ACTIVE = sync/integration/restore flow is active
+- DISABLED = flow is stopped
+- BLOCKED = restore is blocked
+
+Only output JSON lines. No markdown, no explanations, no extra text.\
+"""
+
+def _parse_file_with_groq(fid, cat, path, idx, is_image=False):
+    """Primary LLM-based parser. Sends file content to Groq and extracts Records.
+    Returns True if at least one record was extracted, False otherwise."""
+    client = _get_groq()
+    if not client:
+        return False
+    try:
+        if is_image:
+            import base64
+            img_b64 = base64.b64encode(path.read_bytes()).decode()
+            ext = path.suffix.lower().lstrip(".")
+            messages = [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{img_b64}"}},
+                {"type": "text", "text": _GROQ_PARSE_SYSTEM + "\n\nExtract all records from this image."}
+            ]}]
+            # No vision model available on Groq free tier — skip images
+            return False
+        else:
+            content = path.read_text(encoding="utf-8", errors="replace")
+            if len(content) > 12000:
+                content = content[:12000] + "\n[truncated]"
+            messages = [
+                {"role": "system", "content": _GROQ_PARSE_SYSTEM},
+                {"role": "user", "content": f"Evidence file ({path.suffix}):\n{content}"}
+            ]
+            model = "qwen/qwen3.8-27b"
+
+        resp = client.chat.completions.create(
+            model=model, messages=messages, max_tokens=1200, temperature=0)
+        global _groq_call_count, _groq_input_tokens, _groq_output_tokens
+        _groq_call_count += 1
+        if resp.usage:
+            _groq_input_tokens  += resp.usage.prompt_tokens
+            _groq_output_tokens += resp.usage.completion_tokens
+
+        extracted = 0
+        for line in resp.choices[0].message.content.strip().splitlines():
+            line = line.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            if not line.startswith("{"): continue
+            try:
+                obj = json.loads(line)
+                rid    = obj.get("resource_id", "").strip()
+                sys_id = obj.get("system_id", "").strip() or _rid_to_sys(rid)
+                email  = obj.get("email", "") or ""
+                uid    = obj.get("user_id", "") or ""
+                state  = obj.get("state", "PRESENT").strip()
+                if not rid: continue
+                if not (_is_email(email) or _is_uid(uid)): continue
+                idx.add(Record(fid, cat, sys_id, rid, state,
+                               emails=[email] if _is_email(email) else [],
+                               user_ids=[uid] if _is_uid(uid) else []))
+                extracted += 1
+            except Exception:
+                pass
+        return extracted > 0
+    except Exception as e:
+        log.warning("Groq parse failed %s: %s", path.name, e)
+        return False
+
+
+def parse_image_groq(fid, cat, path, idx):
+    """Parse PNG/image evidence via Groq vision model. Falls back silently if unavailable."""
+    client = _get_groq()
+    if not client:
+        return
+    try:
+        import base64
+        img_b64 = base64.b64encode(path.read_bytes()).decode()
+        ext = path.suffix.lower().lstrip(".")
+        resp = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/{ext};base64,{img_b64}"}},
+                {"type": "text", "text": (
+                    "Extract all personal data records visible in this image. "
+                    "For each record output one JSON line with fields: "
+                    "resource_id, system_id, email, user_id, state. "
+                    "state must be one of: PRESENT, ABSENT, REDACTED, ANONYMIZED. "
+                    "Only output records that have resource_id and at least one identifier (email or user_id). "
+                    "Output only raw JSON lines, nothing else."
+                )}
+            ]}],
+            max_tokens=600,
+            temperature=0,
+        )
+        content = resp.choices[0].message.content.strip()
+        for line in content.splitlines():
+            line = line.strip().lstrip("```json").rstrip("```").strip()
+            if not line.startswith("{"): continue
+            try:
+                obj = json.loads(line)
+                rid = obj.get("resource_id", "")
+                sys_id = obj.get("system_id", "") or _rid_to_sys(rid)
+                email = obj.get("email", "") or ""
+                uid = obj.get("user_id", "") or ""
+                state = obj.get("state", "PRESENT")
+                if rid and (_is_email(email) or _is_uid(uid)):
+                    idx.add(Record(fid, cat, sys_id, rid, state,
+                                   emails=[email] if _is_email(email) else [],
+                                   user_ids=[uid] if _is_uid(uid) else []))
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("Image parse via Groq failed %s: %s", path.name, e)
+
+
 def parse_pdf(fid, cat, path, idx):
     """Extract records from PDF documents using stdlib zlib decompression."""
     try:
@@ -776,12 +924,20 @@ def build_index(evidence_csv, hash_to_emails: Dict[str,str]):
         if not path.exists(): continue
         fname=path.name.lower(); suf=path.suffix.lower()
         try:
+            is_image = suf in (".png", ".jpg", ".jpeg", ".webp")
+            # LLM-first: try Groq for non-SQL formats (SQL parser is deterministic and precise)
+            groq_ok = False
+            if suf != ".sql":
+                groq_ok = _parse_file_with_groq(fid, cat, path, idx, is_image=is_image)
+
+            # Deterministic fallback: run proven parser alongside LLM
+            # (always runs for structured formats to catch records LLM may miss)
             if suf==".txt":
                 parse_handover_txt(fid,cat,path,idx)
-            elif suf==".json":
+            elif suf==".json" and not is_image:
                 data=_jload(path)
-                if data is None: continue
-                if "service_exports" in data:
+                if data is None: pass
+                elif "service_exports" in data:
                     parse_sre_json(fid,cat,data,idx)
                 elif "snapshots" in data:
                     parse_snapshot_bundle(fid,cat,data,idx)
@@ -794,7 +950,6 @@ def build_index(evidence_csv, hash_to_emails: Dict[str,str]):
                     else:
                         parse_generic_records(fid,cat,data,idx)
                 elif "records" in data:
-                    # Generic records format
                     records=data["records"]
                     if records and "system" in records[0]:
                         parse_generic_records(fid,cat,data,idx)
@@ -805,7 +960,6 @@ def build_index(evidence_csv, hash_to_emails: Dict[str,str]):
                     else:
                         parse_generic_records(fid,cat,data,idx)
                 else:
-                    # Fallback: scan for resource_id + email
                     parse_generic_records(fid,cat,data,idx)
             elif suf==".sql":
                 parse_sql(fid,cat,path,idx)
@@ -818,6 +972,7 @@ def build_index(evidence_csv, hash_to_emails: Dict[str,str]):
                     parse_service_events_log(fid,cat,path,idx,hash_to_emails)
             elif suf==".pdf":
                 parse_pdf(fid,cat,path,idx)
+            # images: handled by Groq only (no deterministic fallback)
         except Exception as e: log.warning("index %s: %s",fid,e)
     log.info("Index: %d email keys, %d uid keys, %d hash keys",
              len(idx._email), len(idx._uid), len(idx._hash))
@@ -1620,6 +1775,47 @@ def is_deletion(text: str) -> bool:
 # Step generator
 # ─────────────────────────────────────────────────────────────────────────────
 
+def find_post_deletion_syncs(activity_path: str, resource_ids: Set[str],
+                             audit_at) -> List[Tuple[str, str, str]]:
+    """Detect SYNC_RECORD or INDEX_RECORD events that ran AFTER a DELETE_RECORD
+    for the same resource, but BEFORE audit_at. These indicate an active data flow
+    that can recreate deleted data.
+    Returns list of (resource_id, target_system, activity_id)."""
+    if not activity_path or not resource_ids:
+        return []
+    RECREATE_OPS = {"SYNC_RECORD", "INDEX_RECORD", "REFRESH_CACHE"}
+    delete_times: Dict[str, "datetime"] = {}
+    recreate_events: List[Tuple[str, str, str, "datetime"]] = []
+    try:
+        for row in load_csv(activity_path):
+            rid = row.get("resource_id", "")
+            if rid not in resource_ids:
+                continue
+            etype = row.get("event_type", "")
+            t = parse_dt(row.get("event_time", ""))
+            if t is None:
+                continue
+            if audit_at and t > audit_at:
+                continue
+            if etype == "DELETE_RECORD":
+                if rid not in delete_times or t > delete_times[rid]:
+                    delete_times[rid] = t
+            elif etype in RECREATE_OPS:
+                recreate_events.append((rid, row.get("target_system", ""), row.get("activity_id", ""), t))
+    except Exception as e:
+        log.warning("post-deletion sync check failed: %s", e)
+        return []
+
+    results = []
+    seen = set()
+    for rid, tsys, act_id, t in recreate_events:
+        del_t = delete_times.get(rid)
+        if del_t and t > del_t and rid not in seen:
+            seen.add(rid)
+            results.append((rid, tsys, act_id))
+    return results
+
+
 def generate_steps(records: List[Record], res2acct: Dict[str,str]=None,
                    activity_path: str=None, emails: List[str]=None, user_ids: List[str]=None,
                    requested_at=None, audit_at=None, ev_rows=None, dataset_dir: "Path"=None,
@@ -1672,6 +1868,28 @@ def generate_steps(records: List[Record], res2acct: Dict[str,str]=None,
 
     findings, remediations, verifications = [], [], []
     incomplete = False
+
+    # Detect sync/index events that ran AFTER deletion — recreated data risk
+    # Exclude account_service: those get VERIFY_RECORD_ABSENT, not DISABLE_DATA_FLOW
+    SYNC_ELIGIBLE_SYSTEMS = {"search_service", "analytics_platform", "marketing_platform",
+                              "integration_service", "export_service"}
+    all_rids = {rid for (sys_id, rid) in best.keys() if sys_id in SYNC_ELIGIBLE_SYSTEMS}
+    if activity_path and all_rids:
+        post_del_syncs = find_post_deletion_syncs(activity_path, all_rids, audit_at)
+        for sync_rid, sync_sys, sync_act_id in post_del_syncs:
+            # Only flag if the record is currently ABSENT (was deleted but re-synced)
+            matching = [rec for (s, r), rec in best.items() if r == sync_rid and rec.state == "ABSENT"]
+            if matching:
+                incomplete = True
+                findings.append({"phase": "FINDING", "system_id": sync_sys or "unknown",
+                                  "resource_id": sync_rid, "operation": "REPORT_ACTIVE_DATA_FLOW",
+                                  "state": "ACTIVE", "evidence_id": ""})
+                remediations.append({"phase": "REMEDIATION", "system_id": sync_sys or "unknown",
+                                     "resource_id": sync_rid, "operation": "DISABLE_DATA_FLOW",
+                                     "state": "DISABLED", "evidence_id": ""})
+                verifications.append({"phase": "VERIFICATION", "system_id": sync_sys or "unknown",
+                                      "resource_id": sync_rid, "operation": "VERIFY_DATA_FLOW_DISABLED",
+                                      "state": "DISABLED", "evidence_id": ""})
 
     for (sys_id,rid),rec in sorted(best.items(), key=lambda x:(sys_rank(x[0][0]),x[0][1])):
         state=rec.state; ev=rec.file_id
@@ -2000,6 +2218,9 @@ def generate_steps(records: List[Record], res2acct: Dict[str,str]=None,
 
 def main():
     import sys
+    global REQUIRED_ACTION
+    REQUIRED_ACTION = _load_required_actions_from_csv(DATASET_DIR/"deletion_rules.csv")
+
     sample_mode = "--sample" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == "sample")
     req_file = "sample_deletion_requests.csv" if sample_mode else "deletion_requests.csv"
     log.info("Loading dataset... (%s)", req_file)
