@@ -1,6 +1,6 @@
 # Ghost Data Still Exists — Deletion Audit Agent
 
-A fully deterministic, zero-dependency deletion-audit agent built for the HackerRank Orchestrate challenge (October 2026). It verifies whether personal data has actually been removed across every system after a deletion request — not just the primary database.
+An AI-powered deletion-audit agent built for the HackerRank Orchestrate challenge (October 2026). Built entirely with **Claude Code** (Claude Opus + Sonnet 4.6) and powered at runtime by **Groq** (qwen/qwen3.8-27b) for intent classification. It verifies whether personal data has actually been removed across every system after a deletion request — not just the primary database.
 
 ## The Problem
 
