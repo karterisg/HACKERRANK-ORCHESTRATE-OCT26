@@ -1,39 +1,50 @@
-# GDPR Deletion Audit Agent
+# Ghost Data Still Exists — Deletion Audit Agent
 
-An automated compliance tool that investigates whether a user's personal data has actually been removed across every system — not just the primary database.
+A fully deterministic, zero-dependency deletion-audit agent built for the HackerRank Orchestrate challenge (October 2026). It verifies whether personal data has actually been removed across every system after a deletion request — not just the primary database.
 
-## Why We Built This
+## The Problem
 
-Most deletion workflows work like this: a user requests account deletion, a job runs, the status flips to "Complete", and everyone moves on. The problem is that personal data rarely lives in just one place. It ends up in:
+A deletion workflow marks a case **Complete**. But personal data rarely lives in one place. It ends up in:
 
-- Backup snapshots taken before the deletion ran
+- Backup snapshots taken before the job ran
 - Analytics platforms that cached the profile
-- Support tickets that quoted personal details
-- Search indexes that still return the user's name
+- Support tickets that quoted personal details verbatim
+- Search indexes still returning the user's name
 - Integration pipelines that will sync the data back tomorrow
 
-By the time anyone notices, there's a GDPR fine on the table and a very unhappy user who tried to create a new account and was told their email is "already registered."
+This agent was built to find every one of those gaps automatically, before they become compliance incidents.
 
-This agent was built to catch that gap automatically — before it becomes a problem.
+## Results
+
+Benchmarked on 32 labeled sample cases:
+
+| Metric | Value |
+|---|---|
+| Status accuracy | **100%** (32/32) |
+| Step precision | **100.0%** |
+| Step recall | **99.0%** |
+| Avg F1 | **99.7%** |
+| Exact sequence match | **93.8%** (30/32) |
+| Runtime (518 cases) | **~2 seconds** |
 
 ## What It Does
 
-Give it a list of deletion requests and a set of evidence files (database snapshots, logs, JSON exports). It will:
+Given a list of deletion requests and a set of evidence files (database snapshots, logs, JSON exports, PDFs), the agent:
 
-1. Figure out if the request is actually asking for deletion (not an export or opt-out)
-2. Recover all identifiers ever linked to that user — current email, old emails, internal IDs, hashed values
-3. Search every evidence file for any record that can be tied back to the user
-4. Check each record against a deletion policy (some things must be deleted, some redacted, some anonymized, some kept)
-5. Return a verdict: **COMPLETE**, **INCOMPLETE**, or **NOT_APPLICABLE**
-6. If incomplete, list exactly what still needs to happen — findings, remediation steps, and verification checks — in the order they should be executed
+1. **Determines intent** — reads `request_text` in any language and decides if it actually authorizes deletion (requests for data access, export, or marketing opt-out are classified `NOT_APPLICABLE`)
+2. **Resolves all identifiers** — combines the current user profile with the full audit history to recover past emails, hashed values, and internal IDs that still appear in older systems
+3. **Indexes all evidence** — parses every file type (SQL snapshots via in-memory SQLite, JSON exports, structured logs, plain-text records, PDFs) and builds a lookup table keyed by every identifier linked to the user
+4. **Applies deletion policy** — checks each record against `deletion_rules.csv` (DELETE, REDACT, ANONYMIZE, RETAIN, ACCOUNT_TOMBSTONE)
+5. **Returns a verdict** — `COMPLETE`, `INCOMPLETE`, or `NOT_APPLICABLE`
+6. **Produces ordered steps** — for incomplete cases: findings, ordered remediation, and follow-up verification checks in the sequence they must execute
 
-## Output
+## Output Format
 
 ```csv
 case_id,deletion_status,steps_json
 ```
 
-Each step in `steps_json` looks like:
+Each step in `steps_json`:
 
 ```json
 {
@@ -47,19 +58,47 @@ Each step in `steps_json` looks like:
 }
 ```
 
-Steps always follow the same order: findings first, then what to fix, then what to verify.
+Steps always follow the order: **FINDING → REMEDIATION → VERIFICATION**. Within REMEDIATION, data flows and restore risks are disabled before dependent records are changed.
 
-## How It Works
+## Architecture
 
-The agent is fully deterministic — no LLM calls at runtime, no external APIs, no randomness. Everything is derived from the evidence files you provide.
+The agent is fully deterministic — no LLM calls at runtime, no external APIs, no randomness.
 
-**Identity resolution** starts by combining the user's current profile with their audit history to recover all past email addresses and internal IDs. This matters because old records often reference an address the user changed years ago.
+### Identity Resolution
 
-**Evidence indexing** parses every file you give it — SQL snapshots (run against in-memory SQLite), JSON exports, structured logs, plain text records — and builds a lookup table keyed by every identifier linked to each user. Records are only included if their capture timestamp falls before the audit cutoff.
+Combines `user_identities.csv` (current snapshot) with `user_audit_log.csv` (historical changes) to build a complete set of past emails, internal user IDs, and email hashes for each subject. A deletion request may reference an address the user changed years ago; this step ensures those old records are still matched.
 
-**Activity correlation** handles the case where a record exists in the system but has no PII — for example, an analytics row that was anonymized and has no email field left. The agent traces system-activity logs to find which account deletion immediately preceded the anonymization event, then uses that account's known identity to link the record back to the user.
+### Evidence Indexing (`EvidenceIndex`)
 
-**Step generation** applies the deletion policy rule by rule. For each record in the wrong state, it generates the finding, the remediation action, and the follow-up verification check. The ordering follows a fixed priority: data flows and restore risks come before the records they can recreate.
+A multi-key in-memory index keyed by email, user_id, email hash, and resource_id. Each evidence file is parsed into `Record` objects and inserted once. Lookup by any identifier returns all matching records captured at or before the case's `audit_at` cutoff.
+
+### Evidence Parsers
+
+| Parser | Handles |
+|---|---|
+| `parse_generic_records` | JSON files with a `records[]` array (system/resource_id/result/subject_reference) |
+| `parse_analytics_records` | `customer_analytics_report` JSON — detects anonymized state by checking for remaining PII fields |
+| `parse_export_jobs_records` | `customer_export_jobs` JSON — maps `owner_email` and `download_available` |
+| `parse_snapshot_bundle` | `customer_data_snapshot_bundle` JSON — multi-store snapshots with per-store state logic |
+| `parse_sre_json` | `service_resource_export` JSON — per-service arrays (account, analytics, backup, export, integration, search, support, identity, marketing, security) |
+| `parse_service_events_log` | `service_events_*.log` — trace-based logs where identifier and resource_id appear on different lines; groups by `trace_id` before building a record |
+| `parse_resource_lookup_log` | `resource_lookup_trace_*.log` — single-line structured logs |
+| SQL files | Run against in-memory SQLite, query relevant tables, extract PII presence and state |
+| PDF / text files | Extracted via regex patterns for emails, user IDs, and resource identifiers |
+
+### Activity Correlation
+
+Handles the edge case where a record exists but has no PII — for example, an analytics row that was anonymized and has no email field. The agent traces `system_activity.csv` to find which account deletion event immediately preceded the anonymization, then uses that account's known identifiers to link the PII-less record back to the subject.
+
+### Step Generation
+
+Applies `REQUIRED_ACTION` rules to every matched record. For each record in the wrong state:
+
+- Generates a `FINDING` step citing the evidence file ID
+- Generates the corresponding `REMEDIATION` step
+- Generates a `VERIFICATION` step for the required final state
+
+Ordering: `DISABLE_DATA_FLOW` and `BLOCK_RESTORE` before any `DELETE_RECORD`/`REDACT_RECORD`/`ANONYMIZE_RECORD`. Steps are deduplicated by `(system_id, resource_id, operation)`.
 
 ## Setup
 
@@ -69,34 +108,32 @@ cd HACKERRANK-ORCHESTRATE-OCT26
 python code/main.py
 ```
 
-Requires Python 3.9+. No external packages.
+**Requires Python 3.9+. No external packages — uses only the standard library.**
 
 Input files go under `dataset/`. Output is written to `output.csv` at the repo root.
 
 ```bash
-# Run against sample cases and compare to known answers
+# Run against the 32 labeled sample cases and compare to known answers
 python code/main.py --sample
 python code/validate.py
 ```
 
-## Adapting It to Your Stack
+## Submission
 
-The agent is designed to be pointed at your own data:
+Challenge and submission URL:  
+**https://wwww.hackerrank.com/contests/hackerrank-orchestrate-october26/challenges/ghost-data-still-exists**
 
-- **Evidence files**: replace or extend the parsers in `code/main.py` to handle your SQL dialect, log format, or JSON schema
-- **Deletion policy**: edit `dataset/deletion_rules.csv` — each row maps a data category to a required action (DELETE, REDACT, ANONYMIZE, RETAIN)
-- **Identity schema**: update `dataset/user_identities.csv` and `dataset/user_audit_log.csv` to match your user table structure
-- **Deletion requests**: swap `dataset/deletion_requests.csv` with your own queue
+Submission artifacts:
 
-## Results
-
-Benchmarked on 32 labeled test cases:
-
-| Metric | Value |
+| Item | Description |
 |---|---|
-| Status accuracy | 100% (32/32) |
-| Step precision | 98.9% |
-| Step recall | 92.7% |
-| Avg F1 | 91.6% |
-| Exact sequence match | 65.6% (21/32) |
-| Runtime (518 cases) | ~2 seconds |
+| `code.zip` | Runnable solution, prompts, configuration, `README.md`, and `evaluation/` reports |
+| `output.csv` | One answer row for every evaluation request (518 cases) |
+| `chat_transcript` | The root `log.txt` generated by the coding agent |
+
+## Evaluation
+
+Reports are in `evaluation/`:
+
+- `evaluation_report.md` — case-level status accuracy, step-level precision/recall/F1, sequence accuracy, three custom test cases, and failures found during development
+- `usage_report.md` — model providers, call counts, token usage, and cost for the final full-dataset run
