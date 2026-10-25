@@ -133,10 +133,40 @@ python code/main.py --sample
 python code/validate.py
 ```
 
-## Built With
+## How We Built It
 
-- **Claude Code** (Claude Opus + Claude Sonnet 4.6) — agent architecture, evidence parsers, identity resolution, step generation logic
-- **Groq** (qwen/qwen3.8-27b) — runtime LLM intent classification, one API call per case
+### Claude Code — The Development Agent
+
+The entire codebase was built using **[Claude Code](https://claude.com/claude-code)**, Anthropic's AI coding agent, running **Claude Opus** and **Claude Sonnet 4.6** throughout the development session.
+
+Claude Code was used for every stage of development:
+
+- **Architecture design** — deciding on the two-layer approach (LLM intent + deterministic evidence analysis), the `EvidenceIndex` data structure, and the multi-parser dispatch system
+- **Evidence parsers** — writing and iterating on all 7 parsers (generic JSON, analytics reports, export jobs, snapshot bundles, service resource exports, service event logs, SQL snapshots) by reading real evidence files and adjusting to their structure
+- **Identity resolution** — building the logic that joins `user_identities.csv` with `user_audit_log.csv` to recover all historical emails, user IDs, and hashes for each subject
+- **Activity correlation** — solving the hard case of PII-less records (anonymized rows with no email) by tracing `system_activity.csv` to link them back to the right subject
+- **Step generation and ordering** — implementing the FINDING → REMEDIATION → VERIFICATION pipeline with the correct dependency ordering (DISABLE_DATA_FLOW before DELETE, etc.)
+- **Validation and debugging** — running `validate.py` after each iteration to measure precision, recall, F1, and exact sequence match against the 32 labeled sample cases
+
+Total development token usage: ~2,000,000 input tokens + ~155,000 output tokens across all sessions (claude-sonnet-4-6).
+
+### Groq — Runtime LLM Inference
+
+For the final submission, **Groq** (free tier) was added to handle intent classification at runtime — the one step where a pure rule-based approach is weakest, especially for non-English or unusual request phrasing.
+
+For each of the 518 cases, the agent sends the `request_text` to **qwen/qwen3.8-27b** via the Groq API with a system prompt that classifies the request as `DELETION` or `NOT_APPLICABLE`. The model handles multilingual requests reliably and returns a single token answer.
+
+| Metric | Value |
+|---|---|
+| API calls (full run) | 518 |
+| Model | qwen/qwen3.8-27b via Groq |
+| Input tokens | 78,306 |
+| Output tokens | 2,082 |
+| Total tokens | 80,388 |
+| Cost | $0.00 (Groq free tier) |
+| Runtime | ~20 min (includes rate-limit retries) |
+
+If the Groq API is unavailable, the agent falls back automatically to regex-based heuristic classification — so the pipeline never fails hard.
 
 ## Submission
 
