@@ -1,6 +1,6 @@
 # Ghost Data Still Exists — Deletion Audit Agent
 
-An AI-powered deletion-audit agent built for the HackerRank Orchestrate challenge (October 2026). Built entirely with **Claude Code** (Claude Opus + Sonnet 4.6) and powered at runtime by **Groq** (qwen/qwen3.8-27b) for intent classification. It verifies whether personal data has actually been removed across every system after a deletion request — not just the primary database.
+A hybrid deletion-audit agent built for the HackerRank Orchestrate challenge (October 2026). Built entirely with **Claude Code** (Claude Opus + Sonnet 4.6) and powered at runtime by **Groq** (qwen/qwen3.8-27b) for intent classification and evidence parsing. It verifies whether personal data has actually been removed across every system after a deletion request — not just the primary database. Deletion policy is loaded dynamically from `deletion_rules.csv`, and active sync flows that could recreate deleted data are detected automatically from the activity stream.
 
 ## The Problem
 
@@ -25,6 +25,7 @@ Benchmarked on 32 labeled sample cases:
 | Step recall | **99.0%** |
 | Avg F1 | **99.7%** |
 | Exact sequence match | **93.8%** (30/32) |
+| Full dataset (518 cases) | COMPLETE=205, INCOMPLETE=303, NOT_APPLICABLE=10 |
 | Runtime (518 cases) | **~20 min** (Groq rate-limit retries) |
 
 ## What It Does
@@ -34,7 +35,7 @@ Given a list of deletion requests and a set of evidence files (database snapshot
 1. **Classifies intent via LLM** — sends `request_text` to a Groq-hosted LLM (qwen/qwen3.8-27b) to determine if the request authorizes deletion in any language. Requests for data access, export, or marketing opt-out are classified `NOT_APPLICABLE`. Falls back to heuristic keyword matching if the API is unavailable.
 2. **Resolves all identifiers** — combines the current user profile with the full audit history to recover past emails, hashed values, and internal IDs that still appear in older systems
 3. **Indexes all evidence** — parses every file type (SQL snapshots via in-memory SQLite, JSON exports, structured logs, plain-text records, PDFs) and builds a lookup table keyed by every identifier linked to the user
-4. **Applies deletion policy** — checks each record against `deletion_rules.csv` (DELETE, REDACT, ANONYMIZE, RETAIN, ACCOUNT_TOMBSTONE)
+4. **Applies deletion policy** — loads `deletion_rules.csv` at startup and checks each record against the dynamic policy table (DELETE, REDACT, ANONYMIZE, RETAIN, ACCOUNT_TOMBSTONE)
 5. **Returns a verdict** — `COMPLETE`, `INCOMPLETE`, or `NOT_APPLICABLE`
 6. **Produces ordered steps** — for incomplete cases: findings, ordered remediation, and follow-up verification checks in the sequence they must execute
 
@@ -64,9 +65,11 @@ Steps always follow the order: **FINDING → REMEDIATION → VERIFICATION**. Wit
 
 The agent uses a two-layer design: an LLM for intent classification, and a deterministic rule engine for everything else.
 
-### LLM Layer — Intent Classification (Groq)
+### LLM Layer — Intent Classification + Evidence Parsing (Groq)
 
-Each case's `request_text` is sent to **qwen/qwen3.8-27b** via the Groq API with a system prompt that distinguishes deletion requests from access, export, and opt-out requests. The model handles multilingual input reliably. One API call per case (518 total). If the API is unavailable, the agent falls back to regex-based heuristic classification automatically.
+Each case's `request_text` is sent to **qwen/qwen3.8-27b** via the Groq API with a system prompt that distinguishes deletion requests from access, export, and opt-out requests. The model handles multilingual input reliably. One API call per case (518 total for intent). If the API is unavailable, the agent falls back to regex-based heuristic classification automatically.
+
+Evidence files (JSON, log, PDF formats) are also sent to Groq as primary parser, extracting records in a structured JSON format. The deterministic parsers run in parallel as fallback, so accuracy is maintained even under API rate limits.
 
 ### Deterministic Layer — Evidence Analysis
 

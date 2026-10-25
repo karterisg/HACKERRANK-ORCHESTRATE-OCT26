@@ -80,31 +80,131 @@ All other users' audit records are locatable through trace_id correlation in log
 
 ## 5. Additional Evaluation Cases
 
-### Custom Case A — Non-Deletion Request (NOT_APPLICABLE)
-**Scenario**: A user submits "Please send me all data associated with my account — I want to know what you have on file."  
-**Expected status**: NOT_APPLICABLE  
-**Expected steps**: []  
-**Rationale**: The request asks for data access/export, not deletion. No deletion action is authorized.
+The following three cases were constructed by hand from the dataset's own systems, identity schema, and policy rules to test specific edge conditions not guaranteed to appear in the 32 sample cases. Each includes a full input row and the expected output steps.
 
-### Custom Case B — Partial Redaction Required (INCOMPLETE)
-**Scenario**: A user's primary account is deleted (ABSENT in account_service), but a support ticket retains their full name and phone number in the ticket body (PRESENT in support_platform, state=PRESENT). Policy requires REDACT for support records.  
-**Expected status**: INCOMPLETE  
-**Expected steps**:
-1. FINDING: `REPORT_EXPOSED_PII`, support_platform, support_XXX, PRESENT
-2. REMEDIATION: `REDACT_RECORD`, support_platform, support_XXX, REDACTED (evidence_id="")
-3. VERIFICATION: `VERIFY_RECORD_ABSENT`, account_service, account_XXX, ABSENT (evidence_id="")
-4. VERIFICATION: `VERIFY_RECORD_REDACTED`, support_platform, support_XXX, REDACTED (evidence_id="")  
-**Rationale**: Incomplete because the support record PII has not yet been redacted.
+---
 
-### Custom Case C — Active Integration Bypass Risk (INCOMPLETE)
-**Scenario**: Account and analytics records are deleted, but an active integration (data_flow_XXX) continues to sync the user's email to an external marketing system. The integration is still enabled at audit_at.  
-**Expected status**: INCOMPLETE  
-**Expected steps**:
-1. FINDING: `REPORT_ACTIVE_DATA_FLOW`, integration_service, data_flow_XXX, ACTIVE
-2. REMEDIATION: `DISABLE_DATA_FLOW`, integration_service, data_flow_XXX, DISABLED (evidence_id="")
-3. VERIFICATION: `VERIFY_RECORD_ABSENT`, account_service, account_XXX, ABSENT (evidence_id="")
-4. VERIFICATION: `VERIFY_DATA_FLOW_DISABLED`, integration_service, data_flow_XXX, DISABLED (evidence_id="")  
-**Rationale**: Even after primary deletion, an active sync flow can recreate prohibited data.
+### Custom Case A — Non-English Deletion Request (NOT_APPLICABLE vs DELETION)
+
+**Input**
+
+| Field | Value |
+|---|---|
+| case_id | custom_001 |
+| email | test.user@example.com |
+| requested_at | 2026-09-01T09:00:00Z |
+| reported_status | COMPLETE |
+| reported_at | 2026-09-01T12:00:00Z |
+| audit_at | 2026-09-02T00:00:00Z |
+| request_text | "Παρακαλώ στείλτε μου όλα τα δεδομένα που έχετε για εμένα — θέλω να δω τι έχετε αποθηκεύσει." |
+
+**Expected output**
+
+```
+deletion_status: NOT_APPLICABLE
+steps_json: []
+```
+
+**Rationale**: The Greek text requests a copy of stored data (data subject access request), not deletion. The intent classifier must distinguish DSAR from right-to-erasure even when the language is not English. A false positive here would mark a non-deletion request as COMPLETE and bypass the full audit.
+
+**What it tests**: Multilingual intent classification. A purely keyword-based classifier that lacks Greek vocabulary defaults to NOT_APPLICABLE (safe) but may misfire for other languages. The Groq LLM call handles this correctly.
+
+---
+
+### Custom Case B — Reported COMPLETE but Active Sync Flow Remains
+
+**Input**
+
+| Field | Value |
+|---|---|
+| case_id | custom_002 |
+| email | sync.victim@northstarshop.com |
+| requested_at | 2026-08-15T10:00:00Z |
+| reported_status | COMPLETE |
+| reported_at | 2026-08-16T08:00:00Z |
+| audit_at | 2026-08-20T00:00:00Z |
+
+**Synthetic evidence state at audit_at**
+
+- `account_service` → account record: ABSENT (deleted 2026-08-15)
+- `analytics_platform` → analytics profile: ABSENT (anonymized 2026-08-15)
+- `integration_service` → data_flow record: PRESENT, `sync_active=true`, `target=marketing_platform`
+- `system_activity.csv` → SYNC_RECORD event for same resource_id on 2026-08-18 (after DELETE_RECORD on 2026-08-15)
+
+**Expected output**
+
+```
+deletion_status: INCOMPLETE
+steps_json: [
+  {"step_no":1,"phase":"FINDING","system_id":"integration_service",
+   "resource_id":"data_flow_sync_001","operation":"REPORT_ACTIVE_DATA_FLOW",
+   "state":"ACTIVE","evidence_id":"evidence_sync_001"},
+  {"step_no":2,"phase":"REMEDIATION","system_id":"integration_service",
+   "resource_id":"data_flow_sync_001","operation":"DISABLE_DATA_FLOW",
+   "state":"DISABLED","evidence_id":""},
+  {"step_no":3,"phase":"VERIFICATION","system_id":"account_service",
+   "resource_id":"account_sync_001","operation":"VERIFY_RECORD_ABSENT",
+   "state":"ABSENT","evidence_id":""},
+  {"step_no":4,"phase":"VERIFICATION","system_id":"integration_service",
+   "resource_id":"data_flow_sync_001","operation":"VERIFY_DATA_FLOW_DISABLED",
+   "state":"DISABLED","evidence_id":""}
+]
+```
+
+**Rationale**: The workflow reported COMPLETE because the primary account was deleted. But an active integration continues to sync the user's email to a marketing platform. The sync-after-deletion detector (`find_post_deletion_syncs`) must flag this as REPORT_ACTIVE_DATA_FLOW and place DISABLE_DATA_FLOW first in remediation.
+
+**What it tests**: Sync-after-deletion detection. The agent must cross-reference `system_activity.csv` timestamps — not just check the evidence files' current state.
+
+---
+
+### Custom Case C — Support Record Requires REDACT Not DELETE
+
+**Input**
+
+| Field | Value |
+|---|---|
+| case_id | custom_003 |
+| email | redact.me@example.com |
+| requested_at | 2026-09-10T14:00:00Z |
+| reported_status | PARTIALLY_COMPLETE |
+| reported_at | 2026-09-11T09:00:00Z |
+| audit_at | 2026-09-12T00:00:00Z |
+| request_text | "I want my account deleted under GDPR Article 17." |
+
+**Synthetic evidence state at audit_at**
+
+- `account_service` → account record: ABSENT ✓
+- `support_platform` → support ticket `support_redact_001`: PRESENT, contains `name="Alice Redact"`, `email="redact.me@example.com"` in ticket body (policy: REDACT)
+- `security_service` → audit log `audit_redact_001`: PRESENT (policy: RETAIN)
+
+**Expected output**
+
+```
+deletion_status: INCOMPLETE
+steps_json: [
+  {"step_no":1,"phase":"FINDING","system_id":"support_platform",
+   "resource_id":"support_redact_001","operation":"REPORT_EXPOSED_PII",
+   "state":"PRESENT","evidence_id":"evidence_redact_001"},
+  {"step_no":2,"phase":"REMEDIATION","system_id":"support_platform",
+   "resource_id":"support_redact_001","operation":"REDACT_RECORD",
+   "state":"REDACTED","evidence_id":""},
+  {"step_no":3,"phase":"VERIFICATION","system_id":"account_service",
+   "resource_id":"account_redact_001","operation":"VERIFY_RECORD_ABSENT",
+   "state":"ABSENT","evidence_id":""},
+  {"step_no":4,"phase":"VERIFICATION","system_id":"support_platform",
+   "resource_id":"support_redact_001","operation":"VERIFY_RECORD_REDACTED",
+   "state":"REDACTED","evidence_id":""},
+  {"step_no":5,"phase":"VERIFICATION","system_id":"security_service",
+   "resource_id":"audit_redact_001","operation":"VERIFY_RECORD_PRESENT",
+   "state":"PRESENT","evidence_id":"evidence_audit_redact_001"}
+]
+```
+
+**Rationale**: Policy requires `REDACT` for support records (not DELETE) and `RETAIN` for security audit logs. The agent must not delete what policy says to keep, and must not skip records that need redaction. A DELETE operation on support_redact_001 would be wrong; RETAIN on audit_redact_001 is correct and must appear as VERIFY_RECORD_PRESENT.
+
+**What it tests**: Correct policy application from `deletion_rules.csv` — the distinction between DELETE, REDACT, and RETAIN actions for different data categories.
+
+---
 
 ## 6. Failures Found and Improvements Made
 
@@ -116,18 +216,29 @@ All other users' audit records are locatable through trace_id correlation in log
 | v4 | Absent accounts (COMPLETE cases) not found when user was deleted before evidence window | Added multi-path account discovery: evidence index → SQL absent check → time-proximity | Fixed cases 01–04, 21, 25 |
 | v5 | Duplicate `VERIFY_RECORD_ABSENT` for account_006 in case_06 | Added `known_accts` check to include already-added verifications before `res2acct` fallback | Fixed case_06 exact sequence |
 | v6 | `_find_absent_account_from_sql` inferred account IDs using naming convention without verification | Added per-table convention check: all existing rows must follow `account_`+`user_id[5:]` pattern | Prevents false positives on full 518-case set |
-| v7 | Status detection: `request_text` in non-English (Greek, Japanese, etc.) was misclassified | Extended keyword matching to cover multilingual deletion vocabulary | Corrected NOT_APPLICABLE classification |
+| v7 | Status detection: `request_text` in non-English (Greek, Japanese, etc.) was misclassified | Replaced regex keyword matching with Groq LLM (qwen/qwen3.8-27b) intent classifier | Correct multilingual NOT_APPLICABLE classification |
 | v8 | Tombstone accounts with anonymized analytics companion records | `build_tombstone_forward_analytics` precomputes tombstone→analytics mapping for COMPLETE cases | Added analytics verification steps for cases 03, 21, 25, 26, 27, 28, 31 |
+| v9 | `deletion_rules.csv` was not loaded at runtime — policy was fully hardcoded | Added `_load_required_actions_from_csv()`, called at startup in `main()` | Agent now data-driven; policy changes require only CSV update |
+| v10 | Evidence parsing relied solely on hardcoded format parsers | Added `_parse_file_with_groq()` as LLM-first parser for JSON/log/PDF formats; deterministic parsers run as fallback | Handles unexpected or loosely structured evidence files |
+| v11 | No detection of sync/index events that re-created data after deletion | Added `find_post_deletion_syncs()`: scans `system_activity.csv` for SYNC_RECORD/INDEX_RECORD after DELETE_RECORD for same resource | Flags active data flows that can recreate deleted data |
 
 ## 7. Full Dataset Summary
 
-Run on all 518 evaluation cases (`dataset/deletion_requests.csv`):
+Run on all 518 evaluation cases (`dataset/deletion_requests.csv`) using the final submitted agent (Groq LLM for intent + evidence, deterministic rule engine for policy and step generation):
 
 | Result | Count |
 |---|---|
-| COMPLETE | 208 |
-| INCOMPLETE | 292 |
-| NOT_APPLICABLE | 18 |
+| COMPLETE | 205 |
+| INCOMPLETE | 303 |
+| NOT_APPLICABLE | 10 |
 | **Total** | **518** |
 
-Runtime: ~1 second. No LLM API calls at evaluation time.
+**Groq API usage (intent classification + evidence parsing):**
+
+| Metric | Value |
+|---|---|
+| Total Groq calls | 518+ (intent) + evidence parsing calls |
+| Input tokens | ~78,306 (intent) |
+| Output tokens | ~2,082 (intent) |
+| Runtime | ~20 min (includes Groq rate-limit retries) |
+| Cost | $0.00 (Groq free tier) |
