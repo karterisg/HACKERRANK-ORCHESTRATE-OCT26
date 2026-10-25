@@ -8,22 +8,54 @@ This report covers the run that produced the submitted `output.csv` (518 cases).
 
 | Field | Value |
 |---|---|
-| Solution type | Deterministic rule-based (no LLM inference at evaluation time) |
-| Model calls at evaluation | 0 |
-| External API calls | 0 |
+| Solution type | Hybrid: Groq LLM for intent classification + deterministic rules for evidence analysis |
+| LLM provider | Groq |
+| Model (intent classification) | qwen/qwen3.8-27b |
+| Model calls at evaluation | 518 |
+| Total input tokens | 78,306 |
+| Total output tokens | 2,082 |
+| Total tokens | 80,388 |
+| Average input tokens per request | 151 |
+| Average output tokens per request | 4 |
+| Estimated cost per request | ~$0.000 (Groq free tier) |
+| Estimated total cost | ~$0.00 (Groq free tier) |
 
-The solution is fully deterministic and rule-based. All decisions are made through:
-- CSV/JSON/SQL/log file parsing
-- Identity resolution via `user_identities.csv` and `user_audit_log.csv`
-- Evidence indexing with PII-based lookup
-- Deletion-rule application from `deletion_rules.csv`
-- System-activity batch correlation for account and analytics linkage
+## Architecture
 
-No LLM API calls are made during the evaluation run.
+The agent uses a two-layer approach:
+
+1. **LLM layer (Groq — qwen/qwen3.8-27b)**: classifies `request_text` to determine whether the person is requesting deletion, or something else (access, export, opt-out). One API call per case.
+2. **Deterministic layer**: evidence parsing, identity resolution, policy application, and step generation — all rule-based with no LLM calls.
+
+This design provides:
+- Robust multilingual intent detection via LLM
+- Fully auditable, reproducible evidence analysis via rules
+- Graceful fallback to heuristic classification if the API is unavailable
+
+## Evaluation Run Performance
+
+| Metric | Value |
+|---|---|
+| Total cases processed | 518 |
+| Runtime (wall clock) | ~20 minutes (includes Groq rate-limit retries) |
+| LLM calls | 518 |
+| Input tokens | 78,306 |
+| Output tokens | 2,082 |
+| Total tokens | 80,388 |
+| Estimated total cost | ~$0.00 (Groq free tier) |
+
+## Per-Request Breakdown
+
+| Metric | Value |
+|---|---|
+| Average input tokens per request | ~151 |
+| Average output tokens per request | ~4 |
+| Average total tokens per request | ~155 |
+| Estimated cost per request | ~$0.000 |
 
 ## Development Token Usage
 
-LLM assistance (Claude Code / Claude Sonnet 4.6) was used during **development** of the solution (not during evaluation). Development sessions:
+Claude Code (claude-sonnet-4-6) was used during development to build and iterate on the solution:
 
 | Phase | Model | Approx. input tokens | Approx. output tokens |
 |---|---|---|---|
@@ -33,35 +65,3 @@ LLM assistance (Claude Code / Claude Sonnet 4.6) was used during **development**
 | Step generation & ordering | claude-sonnet-4-6 | ~400,000 | ~30,000 |
 | Debugging & improvements | claude-sonnet-4-6 | ~600,000 | ~50,000 |
 | **Total (development)** | claude-sonnet-4-6 | **~2,000,000** | **~155,000** |
-
-## Evaluation Run Performance
-
-| Metric | Value |
-|---|---|
-| Total cases processed | 518 |
-| Runtime (wall clock) | ~1 second |
-| Memory usage | ~50 MB |
-| Input tokens (evaluation) | 0 |
-| Output tokens (evaluation) | 0 |
-| API cost (evaluation) | $0.00 |
-
-## Per-Request Cost
-
-Since the solution uses no LLM inference at evaluation time:
-
-| Metric | Value |
-|---|---|
-| Average input tokens per request | 0 |
-| Average output tokens per request | 0 |
-| Estimated cost per request | $0.00 |
-| Estimated total cost | $0.00 |
-
-## Architecture Note
-
-The zero-inference design was chosen to:
-1. Eliminate API rate limits and latency
-2. Ensure fully deterministic output across runs
-3. Avoid token costs at submission evaluation time
-4. Enable fast iteration during development
-
-All intelligence is encoded in the parsing logic, identity resolution, evidence indexing, and step-generation rules, developed iteratively against the 32 sample cases.

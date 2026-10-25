@@ -2,14 +2,38 @@
 """
 Deletion Audit Agent — Ghost Data Still Exists
 HackerRank Orchestrate Challenge, October 2026
-Rule-based deterministic agent — no external API required.
+AI-powered agent: Groq LLM for intent classification, deterministic rules for evidence analysis.
 """
 
-import csv, json, re, sqlite3, logging
+import csv, json, re, sqlite3, logging, os
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from typing import Optional, Dict, List, Tuple, Set
+
+# Load .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")
+except ImportError:
+    pass
+
+# Groq client (lazy init)
+_groq_client = None
+_groq_call_count = 0
+_groq_input_tokens = 0
+_groq_output_tokens = 0
+
+def _get_groq():
+    global _groq_client
+    if _groq_client is None:
+        try:
+            from groq import Groq
+            _groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        except Exception as e:
+            log.warning("Groq unavailable (%s) — falling back to heuristic intent detection", e)
+            _groq_client = False
+    return _groq_client
 
 REPO_ROOT   = Path(__file__).parent.parent
 DATASET_DIR = REPO_ROOT / "dataset"
@@ -1549,13 +1573,47 @@ FOREIGN_DELETION = re.compile(
     re.IGNORECASE
 )
 
-def is_deletion(text: str) -> bool:
+def _is_deletion_heuristic(text: str) -> bool:
     if not text or not text.strip(): return False
     ascii_ratio = sum(1 for c in text if ord(c) < 128) / max(len(text),1)
-    if ascii_ratio < 0.6: return True  # mostly non-ASCII → foreign language deletion
+    if ascii_ratio < 0.6: return True
     if EXPLICIT_DELETION.search(text): return True
     if FOREIGN_DELETION.search(text): return True
     return bool(DELETION_VERBS.search(text) and DELETION_NOUNS.search(text))
+
+def is_deletion(text: str) -> bool:
+    global _groq_call_count, _groq_input_tokens, _groq_output_tokens
+    if not text or not text.strip(): return False
+    client = _get_groq()
+    if not client:
+        return _is_deletion_heuristic(text)
+    try:
+        resp = client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {"role": "system", "content":
+                    "You are a GDPR compliance classifier. "
+                    "Reply with exactly one word: DELETION or NOT_APPLICABLE.\n"
+                    "DELETION = the person is requesting erasure/deletion of their personal data, "
+                    "OR asking to verify/confirm/audit that their deletion was completed, "
+                    "OR following up on a previous deletion request.\n"
+                    "NOT_APPLICABLE = the request is purely for data access, export, correction, "
+                    "marketing opt-out, or has nothing to do with deletion at all."},
+                {"role": "user", "content": f"Request text: {text[:1000]}"}
+            ],
+            max_tokens=5,
+            temperature=0,
+        )
+        _groq_call_count += 1
+        usage = resp.usage
+        if usage:
+            _groq_input_tokens  += usage.prompt_tokens
+            _groq_output_tokens += usage.completion_tokens
+        answer = resp.choices[0].message.content.strip().upper()
+        return "DELETION" in answer
+    except Exception as e:
+        log.warning("Groq call failed (%s) — using heuristic", e)
+        return _is_deletion_heuristic(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2072,6 +2130,9 @@ def main():
         w=csv.DictWriter(f,fieldnames=["case_id","deletion_status","steps_json"])
         w.writeheader(); w.writerows(results)
     log.info("Done. %d rows: COMPLETE=%d INCOMPLETE=%d NOT_APPLICABLE=%d",len(results),comp,inc,na)
+    if _groq_call_count:
+        log.info("Groq usage: %d calls, %d input tokens, %d output tokens",
+                 _groq_call_count, _groq_input_tokens, _groq_output_tokens)
 
 
 if __name__=="__main__":
