@@ -114,13 +114,11 @@ cd HACKERRANK-ORCHESTRATE-OCT26
 pip install groq python-dotenv
 ```
 
-Create a `.env` file at the repo root:
+Create a `.env` file at the repo root with your Groq API key (free at `console.groq.com`, no credit card required):
 
 ```
-GROQ_API_KEY=your_key_here
+GROQ_API_KEY=<your_key>
 ```
-
-Get a free API key at `console.groq.com` (no credit card required, 14,400 requests/day free tier).
 
 **Requires Python 3.9+.**
 
@@ -134,6 +132,11 @@ python code/main.py
 python code/main.py --sample
 python code/validate.py
 ```
+
+## Built With
+
+- **Claude Code** (Claude Opus + Claude Sonnet 4.6) — agent architecture, evidence parsers, identity resolution, step generation logic
+- **Groq** (qwen/qwen3.8-27b) — runtime LLM intent classification, one API call per case
 
 ## Submission
 
