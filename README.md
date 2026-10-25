@@ -25,7 +25,7 @@ Benchmarked on 32 labeled sample cases:
 | Step recall | **99.0%** |
 | Avg F1 | **99.7%** |
 | Exact sequence match | **93.8%** (30/32) |
-| Runtime (518 cases) | **~2 seconds** |
+| Runtime (518 cases) | **~20 min** (Groq rate-limit retries) |
 
 ## What It Does
 
